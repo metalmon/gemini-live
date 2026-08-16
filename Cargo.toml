@@ -9,3 +9,4 @@ repository = "https://github.com/metalmon/gemini-live"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"

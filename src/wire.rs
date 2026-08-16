@@ -1,9 +1,131 @@
 //! Pure setup serialization + server-message/affective parsing (no I/O).
 //! Populated in Tasks 3-5.
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 
-use crate::types::SetupConfig;
+use crate::types::{Role, ServerEvent, SetupConfig};
+
+/// A `parse_server_message` failure. Malformed JSON or malformed base64
+/// audio inside an otherwise well-formed message; never panics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireError(pub String);
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for WireError {}
+
+impl From<serde_json::Error> for WireError {
+    fn from(e: serde_json::Error) -> Self {
+        WireError(format!("bad JSON: {e}"))
+    }
+}
+
+/// Decode one `inlineData.data` base64 blob to PCM16 samples. Proto3 JSON's
+/// `bytes` field accepts both standard and URL-safe base64 alphabets (with
+/// or without padding); try each so a server that picks either form still
+/// parses.
+fn decode_pcm16(b64: &str) -> Result<Vec<i16>, WireError> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    let bytes = STANDARD
+        .decode(b64)
+        .or_else(|_| STANDARD_NO_PAD.decode(b64))
+        .or_else(|_| URL_SAFE.decode(b64))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(b64))
+        .map_err(|e| WireError(format!("bad base64 audio: {e}")))?;
+    Ok(bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect())
+}
+
+/// Parse one server WebSocket frame (binary or text, UTF-8 JSON either way)
+/// into zero or more [`ServerEvent`]s.
+///
+/// Mirrors the google-genai SDK's `_LiveServerMessage_from_mldev` converter
+/// path (`_live_converters.py`) and, critically, `LiveServerMessage.text`'s
+/// part-filtering rule (`types.py`): a `modelTurn` part with `thought: true`
+/// is the model's internal reasoning/annotation channel — NOT surfaced
+/// content — so the SDK skips it when assembling output. This is also how
+/// native-audio's affective control tokens (`<ctrl95>` / `emotion_*`) stay
+/// out of the transcript/audio the caller sees: they ride inside `thought`
+/// parts. We mirror that by skipping any `thought: true` part entirely
+/// (its `inlineData` audio included, not just text) before extracting
+/// content, matching the SDK's stated intent even though the SDK's own
+/// `.data` property does not itself branch on `thought` (only `.text`
+/// does) — see the brief for this task.
+///
+/// Where kutsu's `proto.rs::parse_server_message` and the SDK disagree, the
+/// SDK wins; this function is that mirror, generalized (no `end_call`
+/// special-casing — `ToolCall` carries the raw name/id/args for any tool).
+pub fn parse_server_message(bytes: &[u8]) -> Result<Vec<ServerEvent>, WireError> {
+    let v: Value = serde_json::from_slice(bytes)?;
+    let mut out = Vec::new();
+
+    if v.get("setupComplete").is_some() {
+        out.push(ServerEvent::SetupComplete);
+    }
+
+    if let Some(sc) = v.get("serverContent") {
+        if let Some(parts) = sc.pointer("/modelTurn/parts").and_then(|p| p.as_array()) {
+            for part in parts {
+                let is_thought = part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
+                if is_thought {
+                    // Internal annotation (reasoning / affective control
+                    // tokens) — not content. Skip entirely.
+                    continue;
+                }
+                if let Some(data) = part.pointer("/inlineData/data").and_then(|d| d.as_str()) {
+                    out.push(ServerEvent::OutputAudio(decode_pcm16(data)?));
+                }
+            }
+        }
+        if let Some(t) =
+            sc.get("outputTranscription").and_then(|t| t.get("text")).and_then(|t| t.as_str())
+        {
+            let final_ = sc
+                .pointer("/outputTranscription/finished")
+                .and_then(|f| f.as_bool())
+                .unwrap_or(false);
+            out.push(ServerEvent::Transcript { role: Role::Model, text: t.to_string(), final_ });
+        }
+        if let Some(t) =
+            sc.get("inputTranscription").and_then(|t| t.get("text")).and_then(|t| t.as_str())
+        {
+            let final_ = sc
+                .pointer("/inputTranscription/finished")
+                .and_then(|f| f.as_bool())
+                .unwrap_or(false);
+            out.push(ServerEvent::Transcript { role: Role::User, text: t.to_string(), final_ });
+        }
+        if sc.get("interrupted").and_then(|i| i.as_bool()).unwrap_or(false) {
+            out.push(ServerEvent::Interrupted);
+        }
+        if sc.get("turnComplete").and_then(|t| t.as_bool()).unwrap_or(false) {
+            out.push(ServerEvent::TurnComplete);
+        }
+    }
+
+    if let Some(calls) = v.pointer("/toolCall/functionCalls").and_then(|c| c.as_array()) {
+        for call in calls {
+            let name = call.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+            let id = call.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string();
+            let args = call.get("args").cloned().unwrap_or(Value::Null);
+            out.push(ServerEvent::ToolCall { name, id, args });
+        }
+    }
+
+    if let Some(h) = v.pointer("/sessionResumptionUpdate/newHandle").and_then(|h| h.as_str()) {
+        out.push(ServerEvent::ResumptionHandle(h.to_string()));
+    }
+
+    if v.get("goAway").is_some() {
+        out.push(ServerEvent::GoAway);
+    }
+
+    Ok(out)
+}
 
 /// Build the first `setup` message for a Gemini Live session. Every value is
 /// sourced from `cfg`; the crate does not assemble prompts or know about
@@ -73,6 +195,12 @@ pub fn build_setup(cfg: &SetupConfig) -> Value {
         // `enableAffectiveDialog` nest under `generationConfig`; `proactivity`
         // is a top-level `setup` field.
         setup["generationConfig"]["thinkingConfig"] = json!({ "thinkingBudget": 0 });
+        // Unlike kutsu's `proto.rs` (which keeps this OFF as a workaround —
+        // its hand-rolled parser doesn't strip the `<ctrl95>`/`emotion_*`
+        // affective control tokens, so they leaked into transcript/audio),
+        // this crate re-enables it: `parse_server_message` below mirrors the
+        // SDK's `thought`-part filtering, so those annotation parts never
+        // reach content in the first place.
         setup["generationConfig"]["enableAffectiveDialog"] = json!(true);
         setup["proactivity"] = json!({ "proactiveAudio": true });
     }
@@ -164,5 +292,111 @@ mod tests {
     fn resume_handle_none_serializes_null() {
         let s = build_setup(&cfg(Model::HalfCascade, None));
         assert!(s["setup"]["sessionResumption"]["handle"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+    use crate::types::{Role, ServerEvent};
+
+    // base64 "AAABAAIAAwA=" -> bytes 00 00 01 00 02 00 03 00 -> i16 LE [0,1,2,3]
+    const AUDIO_B64: &str = "AAABAAIAAwA=";
+
+    #[test]
+    fn parses_audio_and_output_transcript_binary_and_string_identically() {
+        let text = format!(
+            r#"{{"serverContent":{{"modelTurn":{{"parts":[{{"inlineData":{{"data":"{AUDIO_B64}"}}}}]}},
+               "outputTranscription":{{"text":"Hello","finished":false}}}}}}"#
+        );
+        let from_string = parse_server_message(text.as_bytes()).unwrap();
+        let from_binary = parse_server_message(text.clone().into_bytes().as_slice()).unwrap();
+        assert_eq!(from_string, from_binary);
+
+        assert!(from_string
+            .iter()
+            .any(|e| matches!(e, ServerEvent::OutputAudio(s) if s == &vec![0, 1, 2, 3])));
+        assert!(from_string.iter().any(|e| matches!(e,
+            ServerEvent::Transcript { role: Role::Model, text, final_: false } if text == "Hello")));
+    }
+
+    #[test]
+    fn thought_part_is_dropped_normal_audio_part_survives() {
+        let text = format!(
+            r#"{{"serverContent":{{"modelTurn":{{"parts":[
+                {{"text":"<ctrl95>emotion_model happy<ctrl95>","thought":true}},
+                {{"inlineData":{{"data":"{AUDIO_B64}"}}}}
+            ]}}}}}}"#
+        );
+        let evs = parse_server_message(text.as_bytes()).unwrap();
+        assert_eq!(evs, vec![ServerEvent::OutputAudio(vec![0, 1, 2, 3])]);
+    }
+
+    #[test]
+    fn output_transcription_finished_maps_to_final_model_transcript() {
+        let text = r#"{"serverContent":{"outputTranscription":{"text":"Bye","finished":true}}}"#;
+        let evs = parse_server_message(text.as_bytes()).unwrap();
+        assert_eq!(
+            evs,
+            vec![ServerEvent::Transcript { role: Role::Model, text: "Bye".into(), final_: true }]
+        );
+    }
+
+    #[test]
+    fn input_transcription_maps_to_user_transcript() {
+        let text = r#"{"serverContent":{"inputTranscription":{"text":"Hi","finished":false}}}"#;
+        let evs = parse_server_message(text.as_bytes()).unwrap();
+        assert_eq!(
+            evs,
+            vec![ServerEvent::Transcript { role: Role::User, text: "Hi".into(), final_: false }]
+        );
+    }
+
+    #[test]
+    fn parses_tool_call_generic() {
+        let text = r#"{"toolCall":{"functionCalls":[
+            {"name":"end_call","id":"fc-1","args":{"disposition":"appointment"}}
+        ]}}"#;
+        let evs = parse_server_message(text.as_bytes()).unwrap();
+        assert_eq!(
+            evs,
+            vec![ServerEvent::ToolCall {
+                name: "end_call".into(),
+                id: "fc-1".into(),
+                args: serde_json::json!({"disposition": "appointment"}),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_resumption_turn_interrupt_setup_goaway() {
+        assert_eq!(
+            parse_server_message(br#"{"sessionResumptionUpdate":{"newHandle":"HANDLE-123"}}"#)
+                .unwrap(),
+            vec![ServerEvent::ResumptionHandle("HANDLE-123".into())]
+        );
+        assert_eq!(
+            parse_server_message(br#"{"serverContent":{"turnComplete":true}}"#).unwrap(),
+            vec![ServerEvent::TurnComplete]
+        );
+        assert_eq!(
+            parse_server_message(br#"{"serverContent":{"interrupted":true}}"#).unwrap(),
+            vec![ServerEvent::Interrupted]
+        );
+        assert_eq!(
+            parse_server_message(br#"{"setupComplete":{}}"#).unwrap(),
+            vec![ServerEvent::SetupComplete]
+        );
+        assert_eq!(parse_server_message(br#"{"goAway":{}}"#).unwrap(), vec![ServerEvent::GoAway]);
+    }
+
+    #[test]
+    fn malformed_json_errors_without_panicking() {
+        assert!(parse_server_message(b"not json").is_err());
+    }
+
+    #[test]
+    fn empty_object_yields_no_events() {
+        assert_eq!(parse_server_message(b"{}").unwrap(), Vec::<ServerEvent>::new());
     }
 }
