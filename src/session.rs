@@ -30,13 +30,6 @@ use crate::wire;
 /// connects (kutsu's `ReconnectState::new(4)`).
 const HANDLE_DROP_AFTER: u32 = 4;
 
-/// Give up (terminal [`Event::SessionClosed`]) after this many consecutive
-/// failed reconnect attempts. kutsu's own loop retries forever because it is
-/// bounded by call-level hangup/end_call semantics the crate does not own; a
-/// library instead surfaces a terminal close so the caller can decide whether
-/// to reconnect afresh.
-const MAX_RECONNECT_ATTEMPTS: u32 = 8;
-
 /// A produced-on-demand transport factory: each call establishes a *fresh*
 /// connection (a new [`WsTransport`] in production; a scripted double in
 /// tests). Used by the reconnect loop; the initial connection is established
@@ -54,6 +47,14 @@ pub struct ClientConfig {
     /// The caller-assembled setup. Its `resume_handle` seeds the first connect;
     /// thereafter the crate replaces it with the latest server-issued handle.
     pub setup: SetupConfig,
+    /// Give up (terminal [`Event::SessionClosed`]) after this many consecutive
+    /// *non-progressing* reconnect attempts (a failed connect, or a connect
+    /// that closes before `setupComplete`). `None` (the default and the match
+    /// for kutsu) is unbounded: the crate reconnects forever, bounded only by
+    /// the caller's own call-level hangup/time-cap. This is safe from
+    /// busy-looping because the backoff caps at 5s. Set `Some(n)` only when the
+    /// caller wants the crate to own a give-up tolerance.
+    pub max_reconnect_attempts: Option<u32>,
 }
 
 /// One event on the unified session stream. `SessionOpened`/`SessionClosed`
@@ -213,6 +214,13 @@ impl<T: Transport> Session<T> {
     /// The unified event stream across reconnects. Drives the transport, parses
     /// frames, resumes+backs-off internally on a resumable close, and returns
     /// `None` only after a terminal [`Event::SessionClosed`].
+    ///
+    /// This method *is* the reconnect loop — its future may be parked inside a
+    /// backoff sleep or a reconnect handshake at any await point. Poll it from a
+    /// single task and to completion; do not race it against other futures or
+    /// drop/cancel it concurrently except for shutdown. Cancelling mid-reconnect
+    /// loses the pending close reason and re-counts the in-flight attempt on the
+    /// next call (it self-heals, but the terminal reason/attempt tally drift).
     pub async fn next_event(&mut self) -> Option<Event> {
         loop {
             if let Some(ev) = self.pending.pop_front() {
@@ -293,28 +301,50 @@ impl<T: Transport> Session<T> {
         }
     }
 
+    /// Record one non-progressing reconnect attempt (a failed connect, or a
+    /// connect that closed before `setupComplete`): advance the consecutive-
+    /// failure count, drop the stale handle at the threshold, and report whether
+    /// the configured attempt budget is now exhausted (→ terminal).
+    fn note_failure(&mut self) -> bool {
+        if self.rstate.on_failure() {
+            self.handle = None; // stale handle after N consecutive failures
+        }
+        matches!(self.cfg.max_reconnect_attempts, Some(max) if self.rstate.fails() >= max)
+    }
+
     /// Perform the reconnect for a just-ended attempt: apply the
-    /// `reconnect_outcome` bookkeeping, then retry connecting (with backoff and
-    /// stale-handle drop) until a fresh transport is open + `setup` re-sent, or
-    /// the attempt budget is exhausted (terminal).
+    /// `reconnect_outcome` bookkeeping, sleep the backoff, then (re)connect —
+    /// retrying failed connects with escalating backoff and stale-handle drop —
+    /// until a fresh transport is open + `setup` re-sent, or the attempt budget
+    /// is exhausted (terminal).
+    ///
+    /// Crucially, the backoff sleep happens **before every reconnect**, not only
+    /// after a failed connect. An endpoint that accepts the WS + setup and then
+    /// closes before `setupComplete` (post-handshake reject / overload / rapid
+    /// goAway) makes `connect` *succeed* every time; sleeping only on connect
+    /// failure would hot-loop that accept-then-close forever. Sleeping up front
+    /// (with backoff advancing — it is reset only on a *progressing* close, per
+    /// `reconnect_outcome`'s `RemoteClose => Some(progressed)`) backs the storm
+    /// off exactly like kutsu's sleep-before-every-reconnect.
     async fn reconnect(&mut self, end: EndKind) -> Result<(), ()> {
         // Bookkeeping for the attempt that just ended (kutsu's reconnect_outcome):
         // Resumable is always a failure; RemoteClose is success iff progress was
         // made — otherwise a consistently-broken endpoint keeps escalating.
-        let success = match end {
-            EndKind::Resumable => false,
-            EndKind::RemoteClose => self.progressed,
-        };
+        let success = matches!(end, EndKind::RemoteClose) && self.progressed;
+        self.progressed = false;
         if success {
             self.rstate.on_success();
             self.backoff.reset();
-        } else if self.rstate.on_failure() {
-            self.handle = None;
+        } else if self.note_failure() {
+            return Err(());
         }
-        self.progressed = false;
 
-        let mut attempts = 0u32;
         loop {
+            // Always back off before (re)connecting — see the method doc: this
+            // is what tames an accept-then-close storm, where `connect` keeps
+            // succeeding but the session never progresses.
+            tokio::time::sleep(self.backoff.next_delay()).await;
+
             if let Ok(t) = (self.reconnect)().await {
                 self.transport = t;
                 if self.open(true).await.is_ok() {
@@ -323,14 +353,9 @@ impl<T: Transport> Session<T> {
                 // setup send failed on the fresh transport: treat as a failed
                 // attempt and keep retrying.
             }
-            attempts += 1;
-            if self.rstate.on_failure() {
-                self.handle = None; // stale handle after N consecutive failures
-            }
-            if attempts >= MAX_RECONNECT_ATTEMPTS {
+            if self.note_failure() {
                 return Err(());
             }
-            tokio::time::sleep(self.backoff.next_delay()).await;
         }
     }
 
@@ -402,6 +427,11 @@ impl ReconnectState {
         self.fails += 1;
         self.reset_handle_after != 0 && self.fails >= self.reset_handle_after
     }
+
+    /// The current consecutive-failure count (drives the terminal attempt bound).
+    fn fails(&self) -> u32 {
+        self.fails
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +453,9 @@ mod tests {
                 goal_schema: serde_json::json!({ "type": "object" }),
                 resume_handle: None,
             },
+            // Matches kutsu: unbounded reconnect (backoff caps at 5s). Tests
+            // that need deterministic termination override with `Some(n)`.
+            max_reconnect_attempts: None,
         }
     }
 
@@ -441,6 +474,25 @@ mod tests {
         let mut slot = Some(next);
         Box::new(move || {
             let t = slot.take();
+            Box::pin(async move {
+                t.ok_or(SessionError::Transport(TransportError::Connect("drained".into())))
+            })
+        })
+    }
+
+    /// A reconnector that yields `n` accept-then-close transports (each accepts
+    /// `setup`, then closes before any `setupComplete` — i.e. no progress),
+    /// then fails. Models a post-handshake-reject / overload storm.
+    fn accept_then_close(n: usize) -> Reconnector<FakeTransport> {
+        let mut queue: VecDeque<FakeTransport> = (0..n)
+            .map(|_| {
+                let mut t = FakeTransport::new(false);
+                t.push_close(1013, "overloaded");
+                t
+            })
+            .collect();
+        Box::new(move || {
+            let t = queue.pop_front();
             Box::pin(async move {
                 t.ok_or(SessionError::Transport(TransportError::Connect("drained".into())))
             })
@@ -495,7 +547,7 @@ mod tests {
         assert!(matches!(s.next_event().await, Some(Event::Interrupted)));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn resumption_handle_stored_not_surfaced_then_replayed_on_reconnect() {
         // Script 1: setupComplete, a fresh handle, then a resumable close.
         let mut first = FakeTransport::new(false);
@@ -544,8 +596,12 @@ mod tests {
         fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
         fake.push_close(1011, "boom");
 
+        // Bound reconnection so it terminates deterministically: one failed
+        // connect is enough to exhaust the budget.
+        let mut c = cfg();
+        c.max_reconnect_attempts = Some(1);
         // No reconnector transport available -> reconnection is exhausted.
-        let mut s = Session::connect_with_reconnector(cfg(), fake, no_reconnect()).await.unwrap();
+        let mut s = Session::connect_with_reconnector(c, fake, no_reconnect()).await.unwrap();
 
         assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false })));
         // Drives: setupComplete -> close -> failed reconnects -> terminal.
@@ -555,6 +611,43 @@ mod tests {
         }
         // Stream has ended.
         assert!(s.next_event().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_then_close_storm_backs_off_and_terminates_at_the_bound() {
+        // Every connection accepts setup then closes before `setupComplete` —
+        // no progress. This must NOT hot-loop: each reconnect backs off (the
+        // backoff advances because a no-progress close never resets it), and
+        // with a bound it terminates after exactly `n` non-progressing attempts.
+        let mut initial = FakeTransport::new(false);
+        initial.push_close(1013, "overloaded");
+
+        let mut c = cfg();
+        c.max_reconnect_attempts = Some(3);
+        // n-1 reconnect transports: initial + 2 reopens = 3 no-progress closes.
+        let mut s =
+            Session::connect_with_reconnector(c, initial, accept_then_close(2)).await.unwrap();
+
+        let start = tokio::time::Instant::now();
+
+        // First open, then two transparent reopens (each accept-then-close),
+        // then the bound is hit → terminal SessionClosed → None.
+        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false })));
+        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: true })));
+        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: true })));
+        match s.next_event().await {
+            Some(Event::SessionClosed { reason }) => assert_eq!(reason.code, 1013),
+            other => panic!("expected SessionClosed after the bound, got {other:?}"),
+        }
+        assert!(s.next_event().await.is_none());
+
+        // Backoff advanced across reopens (300ms + 600ms), not a zero-delay
+        // storm and not a constant base delay (which would total 600ms).
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(800),
+            "reconnects must back off with an advancing delay, elapsed = {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
