@@ -44,17 +44,17 @@ fn decode_pcm16(b64: &str) -> Result<Vec<i16>, WireError> {
 /// into zero or more [`ServerEvent`]s.
 ///
 /// Mirrors the google-genai SDK's `_LiveServerMessage_from_mldev` converter
-/// path (`_live_converters.py`) and, critically, `LiveServerMessage.text`'s
-/// part-filtering rule (`types.py`): a `modelTurn` part with `thought: true`
-/// is the model's internal reasoning/annotation channel — NOT surfaced
-/// content — so the SDK skips it when assembling output. This is also how
-/// native-audio's affective control tokens (`<ctrl95>` / `emotion_*`) stay
-/// out of the transcript/audio the caller sees: they ride inside `thought`
-/// parts. We mirror that by skipping any `thought: true` part entirely
-/// (its `inlineData` audio included, not just text) before extracting
-/// content, matching the SDK's stated intent even though the SDK's own
-/// `.data` property does not itself branch on `thought` (only `.text`
-/// does) — see the brief for this task.
+/// path (`_live_converters.py`) and `LiveServerMessage`'s `.text`/`.data`
+/// accessors (`types.py`). A `modelTurn` part's `thought: true` flag marks
+/// the model's internal reasoning/annotation channel, but the SDK only
+/// filters on it for **text** (`.text` does `if part.thought: continue`
+/// before concatenating). `.data` (audio) concatenates every part's
+/// `inlineData` unconditionally — it does not branch on `thought` at all.
+/// This crate has no part-level text-extraction path (model text comes from
+/// `outputTranscription`, not `modelTurn.parts`), so in practice `thought`
+/// currently has nothing to filter here: all `inlineData` audio is passed
+/// through regardless of `thought`, matching `.data` exactly. If a
+/// part-text path is ever added, gate *that* on `thought`, not audio.
 ///
 /// Where kutsu's `proto.rs::parse_server_message` and the SDK disagree, the
 /// SDK wins; this function is that mirror, generalized (no `end_call`
@@ -70,12 +70,10 @@ pub fn parse_server_message(bytes: &[u8]) -> Result<Vec<ServerEvent>, WireError>
     if let Some(sc) = v.get("serverContent") {
         if let Some(parts) = sc.pointer("/modelTurn/parts").and_then(|p| p.as_array()) {
             for part in parts {
-                let is_thought = part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
-                if is_thought {
-                    // Internal annotation (reasoning / affective control
-                    // tokens) — not content. Skip entirely.
-                    continue;
-                }
+                // Mirror the SDK's `.data` accessor: every part's
+                // `inlineData` is surfaced, thought-agnostic. `thought`
+                // only ever gates text extraction (see the SDK's `.text`),
+                // and this crate has no part-level text path to gate.
                 if let Some(data) = part.pointer("/inlineData/data").and_then(|d| d.as_str()) {
                     out.push(ServerEvent::OutputAudio(decode_pcm16(data)?));
                 }
@@ -321,11 +319,16 @@ mod parse_tests {
     }
 
     #[test]
-    fn thought_part_is_dropped_normal_audio_part_survives() {
+    fn thought_part_audio_is_not_dropped_mirrors_sdk_data_accessor() {
+        // The SDK's `LiveServerMessage.data` concatenates every part's
+        // `inlineData` unconditionally — it does NOT branch on `thought`
+        // (only `.text` does). A `thought: true` part carrying `inlineData`
+        // must still surface as `OutputAudio`; real model speech must never
+        // be dropped because of the `thought` flag.
         let text = format!(
             r#"{{"serverContent":{{"modelTurn":{{"parts":[
                 {{"text":"<ctrl95>emotion_model happy<ctrl95>","thought":true}},
-                {{"inlineData":{{"data":"{AUDIO_B64}"}}}}
+                {{"inlineData":{{"data":"{AUDIO_B64}"}},"thought":true}}
             ]}}}}}}"#
         );
         let evs = parse_server_message(text.as_bytes()).unwrap();
