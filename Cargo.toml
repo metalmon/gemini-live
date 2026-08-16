@@ -1,0 +1,9 @@
+[package]
+name = "gemini-live"
+version = "0.1.0"
+edition = "2021"
+description = "A focused Rust client for the Google Gemini Live API: wire serialization, message parsing, WebSocket transport, and a reconnect/resumption session driver."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/metalmon/gemini-live"
+
+[dependencies]
