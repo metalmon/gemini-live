@@ -206,6 +206,49 @@ pub fn build_setup(cfg: &SetupConfig) -> Value {
     json!({ "setup": setup })
 }
 
+/// Serialize one uplink audio frame as a `realtime_input` message: PCM16 @
+/// 16 kHz, little-endian, base64-encoded. Ported byte-for-byte from kutsu's
+/// `gemini_live::build_realtime_input` — the serialized bytes must stay
+/// identical (the session layer's uplink is asserted against this exact
+/// shape).
+pub fn build_realtime_input(pcm: &[i16]) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    let mut bytes = Vec::with_capacity(pcm.len() * 2);
+    for &s in pcm {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    let data = STANDARD.encode(&bytes);
+    json!({
+        "realtime_input": { "audio": { "mimeType": "audio/pcm;rate=16000", "data": data } }
+    })
+    .to_string()
+}
+
+/// Build a `client_content` message carrying a single completed user turn.
+/// The caller (kutsu) uses this to hand the model the first/next turn (e.g.
+/// GREET_CUE / RESUME_CUE); the crate itself is content-agnostic. Ported
+/// verbatim from kutsu's `gemini_live::build_client_content`.
+pub fn build_client_content(text: &str) -> String {
+    json!({
+        "client_content": {
+            "turns": [ { "role": "user", "parts": [ { "text": text } ] } ],
+            "turnComplete": true
+        }
+    })
+    .to_string()
+}
+
+/// Acknowledge a tool call by `call_id` with a trivial success response.
+/// kutsu owns any tool semantics (e.g. `end_call`); this only closes the
+/// function-call loop on the wire. Ported verbatim from kutsu's
+/// `gemini_live::build_tool_response`.
+pub fn build_tool_response(call_id: &str) -> String {
+    json!({
+        "tool_response": { "functionResponses": [ { "id": call_id, "response": { "ok": true } } ] }
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +333,28 @@ mod tests {
     fn resume_handle_none_serializes_null() {
         let s = build_setup(&cfg(Model::HalfCascade, None));
         assert!(s["setup"]["sessionResumption"]["handle"].is_null());
+    }
+
+    #[test]
+    fn realtime_input_is_byte_identical_to_kutsu() {
+        // PCM16 [0, 1] -> LE bytes 00 00 01 00 -> base64 "AAABAA==". Keys are
+        // emitted in serde_json's default (sorted) order, matching kutsu's.
+        assert_eq!(
+            build_realtime_input(&[0i16, 1i16]),
+            r#"{"realtime_input":{"audio":{"data":"AAABAA==","mimeType":"audio/pcm;rate=16000"}}}"#
+        );
+    }
+
+    #[test]
+    fn client_content_and_tool_response_shapes() {
+        assert_eq!(
+            build_client_content("hi"),
+            r#"{"client_content":{"turnComplete":true,"turns":[{"parts":[{"text":"hi"}],"role":"user"}]}}"#
+        );
+        assert_eq!(
+            build_tool_response("c1"),
+            r#"{"tool_response":{"functionResponses":[{"id":"c1","response":{"ok":true}}]}}"#
+        );
     }
 }
 
