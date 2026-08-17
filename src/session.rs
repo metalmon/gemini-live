@@ -3,24 +3,40 @@
 //! [`Session`] owns exactly one thing: the *connection lifecycle*. It connects,
 //! sends `setup`, drives the transport, parses server frames into [`Event`]s,
 //! remembers the session-resumption handle, and — on a resumable close —
-//! reconnects with backoff and transparently resumes, all behind one unified
-//! [`Session::next_event`] stream.
+//! reconnects with backoff and transparently resumes.
+//!
+//! The lifecycle runs in an **internal `tokio::spawn`ed task** that owns the
+//! transport and the reconnect/backoff loop. The public API is therefore
+//! *cancel-safe*: [`Session::recv_event`] is a plain `mpsc` receive (the
+//! reconnect loop lives in the task, never in the caller's `select!`, so a
+//! caller that races `recv_event` against other futures can never cancel a
+//! reconnect mid-flight), and the `send_*` methods enqueue a command to the task
+//! over a channel (they take `&self`). This is the fix for the reconnect
+//! *starvation* that a caller-driven `next_event` racing a ~20 ms audio arm
+//! would cause: every audio frame used to cancel the backoff sleep so the
+//! reconnect never completed. Now the task drains (and discards) audio commands
+//! while it is reconnecting, and the backoff runs to completion regardless of
+//! caller traffic.
 //!
 //! It deliberately does **not** own call semantics: the greeting timer, energy
 //! VAD, audio-forwarding decisions, RESUME_CUE/GREET_CUE wording, the uplink
 //! drain, or `end_call` handling. Those live in the caller (kutsu), built on
-//! top of this API — the caller reacts to `SessionOpened { is_reconnect }` and
-//! decides what to send via [`Session::send_audio`] /
+//! top of this API — the caller reacts to `SessionOpened { is_reconnect, resumed }`
+//! and decides what to send via [`Session::send_audio`] /
 //! [`Session::send_client_text`] / [`Session::send_tool_response`].
 //!
-//! The reconnect/backoff policy is ported from kutsu's `gemini_live::start` +
-//! `reconnect_outcome` + `reconnect::{Backoff, ReconnectState}`: backoff
-//! 0.3s → ×2 → max 5s, and the stored resumption handle is dropped as stale
-//! after [`HANDLE_DROP_AFTER`] consecutive failed connects.
+//! The reconnect/backoff policy is ported from kutsu's original `gemini_live`:
+//! backoff 0.3s → ×2 → max 5s; the stored resumption handle is dropped as stale
+//! after [`HANDLE_DROP_AFTER`] consecutive failed connects; and the *initial*
+//! connect applies the same bounded backoff+retry so a transient blip during the
+//! SIP ring never kills the call.
 
-use std::collections::VecDeque;
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::pin::Pin;
+use std::time::Duration;
+
+use tokio::sync::mpsc;
 
 use crate::transport::{ProxyConfig, Transport, TransportError, WsTransport};
 use crate::types::{AffectLabel, CloseReason, Model, Role, ServerEvent, SetupConfig};
@@ -29,6 +45,13 @@ use crate::wire;
 /// Drop the stored resumption handle after this many consecutive failed
 /// connects (kutsu's `ReconnectState::new(4)`).
 const HANDLE_DROP_AFTER: u32 = 4;
+
+/// Bounded capacity of the outbound command channel (audio/client-text/tool
+/// responses). Mirrors the old uplink channel depth.
+const CMD_CAPACITY: usize = 64;
+
+/// Bounded capacity of the inbound event channel.
+const EVENT_CAPACITY: usize = 256;
 
 /// A produced-on-demand transport factory: each call establishes a *fresh*
 /// connection (a new [`WsTransport`] in production; a scripted double in
@@ -47,13 +70,13 @@ pub struct ClientConfig {
     /// The caller-assembled setup. Its `resume_handle` seeds the first connect;
     /// thereafter the crate replaces it with the latest server-issued handle.
     pub setup: SetupConfig,
-    /// Give up (terminal [`Event::SessionClosed`]) after this many consecutive
-    /// *non-progressing* reconnect attempts (a failed connect, or a connect
+    /// Give up (terminal [`Event::SessionClosed`], or an `Err` from
+    /// [`Session::connect`] on the *initial* connect) after this many
+    /// consecutive *non-progressing* attempts (a failed connect, or a connect
     /// that closes before `setupComplete`). `None` (the default and the match
     /// for kutsu) is unbounded: the crate reconnects forever, bounded only by
     /// the caller's own call-level hangup/time-cap. This is safe from
-    /// busy-looping because the backoff caps at 5s. Set `Some(n)` only when the
-    /// caller wants the crate to own a give-up tolerance.
+    /// busy-looping because the backoff caps at 5s.
     pub max_reconnect_attempts: Option<u32>,
 }
 
@@ -72,7 +95,7 @@ pub enum Event {
     /// lost. The first open is always `is_reconnect: false, resumed: false`.
     SessionOpened { is_reconnect: bool, resumed: bool },
     /// Terminal: reconnection was exhausted or the close is unrecoverable. The
-    /// stream ends after this (`next_event` returns `None` thereafter).
+    /// stream ends after this (`recv_event` returns `None` thereafter).
     SessionClosed { reason: CloseReason },
     /// 24 kHz PCM16 output audio.
     OutputAudio(Vec<i16>),
@@ -89,12 +112,16 @@ pub enum Event {
 #[derive(Debug)]
 pub enum SessionError {
     Transport(TransportError),
+    /// The session's driver task has terminated (a terminal close, or the
+    /// session was dropped); a `send_*` after that point returns this.
+    Closed,
 }
 
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SessionError::Transport(e) => write!(f, "transport: {e}"),
+            SessionError::Closed => write!(f, "session closed"),
         }
     }
 }
@@ -107,43 +134,45 @@ impl From<TransportError> for SessionError {
     }
 }
 
-/// How the just-ended attempt terminated — drives the reconnect bookkeeping
-/// (kutsu's `reconnect_outcome`). `Resumable` (goAway / send / protocol error)
-/// is always a failure; `RemoteClose` (a clean WS close or a dropped stream)
-/// is a success only if the attempt made real progress.
+/// How the just-ended attempt terminated — drives the reconnect bookkeeping.
+/// `Resumable` (goAway / send / protocol error) is always a failure;
+/// `RemoteClose` (a clean WS close or a dropped stream) is a success only if the
+/// attempt made real progress.
 #[derive(Clone, Copy)]
 enum EndKind {
     Resumable,
     RemoteClose,
 }
 
-/// The reconnect/resumption driver. Generic over the transport so tests can
-/// inject a scripted [`crate::transport::FakeTransport`]; [`Session::connect`]
-/// pins it to the real [`WsTransport`].
-pub struct Session<T: Transport = WsTransport> {
-    transport: T,
-    cfg: ClientConfig,
-    /// The latest session-resumption handle (seeded from `cfg.setup`, updated
-    /// on every `sessionResumptionUpdate`, dropped as stale per the policy).
-    handle: Option<String>,
-    reconnect: Reconnector<T>,
-    backoff: Backoff,
-    rstate: ReconnectState,
-    /// Events parsed but not yet handed out (drained before any transport read).
-    pending: VecDeque<Event>,
-    /// Set when the current attempt must reconnect; carries the close reason to
-    /// surface if reconnection turns out to be terminal.
-    pending_reconnect: Option<(EndKind, CloseReason)>,
-    /// Whether the current attempt reached `setupComplete` or got a fresh
-    /// handle — i.e. made real progress (feeds the `RemoteClose` success rule).
-    progressed: bool,
-    /// Latched once a terminal `SessionClosed` has been emitted.
-    terminal: bool,
+/// An outbound request from the caller to the driver task. The task performs the
+/// actual transport write (byte-identical to the old inline builders).
+enum Command {
+    Audio(Vec<i16>),
+    ClientText(String),
+    ToolResponse(String),
 }
 
-impl Session<WsTransport> {
-    /// Connect (first open) and send `setup`. The first [`Session::next_event`]
-    /// yields `SessionOpened { is_reconnect: false }`.
+/// The public session handle: a cancel-safe event stream + an enqueue-only
+/// command channel to the internal driver task. Dropping it closes both
+/// channels; the task then drains any already-queued commands (e.g. a final
+/// `end_call` ack) and exits on its own, dropping the transport (which closes
+/// the WS). It is intentionally NOT aborted on drop, so that last enqueued ack
+/// is still delivered before teardown.
+pub struct Session {
+    cmd_tx: mpsc::Sender<Command>,
+    events: mpsc::Receiver<Event>,
+}
+
+impl Session {
+    /// Connect (first open) with bounded backoff+retry, then spawn the driver
+    /// task. The first [`Session::recv_event`] yields
+    /// `SessionOpened { is_reconnect: false, resumed: false }`.
+    ///
+    /// The *initial* connect is retried with the same backoff as reconnects, so
+    /// a transient network blip (e.g. during the SIP ring) does not kill the
+    /// call. It only returns `Err` when `max_reconnect_attempts` is `Some(n)`
+    /// and that budget is exhausted; with `None` it retries until the socket
+    /// opens (the caller's own task/time-cap bounds it).
     pub async fn connect(cfg: ClientConfig) -> Result<Self, SessionError> {
         let model = cfg.model;
         // The reconnect factory re-establishes a fresh WS each time, cloning the
@@ -162,224 +191,337 @@ impl Session<WsTransport> {
             })
         };
 
-        let transport = WsTransport::connect(model, &cfg.api_key, cfg.proxy.as_ref())
-            .await
-            .map_err(SessionError::from)?;
-        Self::start(cfg, transport, reconnect).await
-    }
-}
+        let mut backoff = Backoff::new(300, 5000);
+        let mut rstate = ReconnectState::new(HANDLE_DROP_AFTER);
+        let mut handle = cfg.setup.resume_handle.clone();
 
-impl<T: Transport> Session<T> {
+        // Initial connect with the same bounded backoff+retry as reconnects.
+        let transport = loop {
+            match WsTransport::connect(model, &cfg.api_key, cfg.proxy.as_ref()).await {
+                Ok(t) => break t,
+                Err(e) => {
+                    if note_failure(&mut rstate, &cfg, &mut handle) {
+                        return Err(SessionError::from(e));
+                    }
+                    tokio::time::sleep(backoff.next_delay()).await;
+                }
+            }
+        };
+
+        Ok(Self::spawn(cfg, transport, reconnect, handle, backoff, rstate))
+    }
+
     /// Construct a session over an already-established transport plus a
     /// reconnect factory. Public but hidden: production goes through
     /// [`Session::connect`]; this exists so tests (and kutsu's tests) can
     /// inject a scripted transport.
     #[doc(hidden)]
-    pub async fn connect_with_reconnector(
-        cfg: ClientConfig,
-        transport: T,
-        reconnect: Reconnector<T>,
-    ) -> Result<Self, SessionError> {
-        Self::start(cfg, transport, reconnect).await
-    }
-
-    async fn start(
+    pub async fn connect_with_transport<T: Transport + 'static>(
         cfg: ClientConfig,
         transport: T,
         reconnect: Reconnector<T>,
     ) -> Result<Self, SessionError> {
         let handle = cfg.setup.resume_handle.clone();
-        let mut s = Session {
-            transport,
-            cfg,
-            handle,
-            reconnect,
-            backoff: Backoff::new(300, 5000),
-            rstate: ReconnectState::new(HANDLE_DROP_AFTER),
-            pending: VecDeque::new(),
-            pending_reconnect: None,
-            progressed: false,
-            terminal: false,
-        };
-        s.open(false).await?;
-        Ok(s)
+        let backoff = Backoff::new(300, 5000);
+        let rstate = ReconnectState::new(HANDLE_DROP_AFTER);
+        Ok(Self::spawn(cfg, transport, reconnect, handle, backoff, rstate))
     }
 
-    /// Send `setup` (carrying the latest stored handle) and queue the
-    /// `SessionOpened` event. Shared by the first open and every reopen.
-    async fn open(&mut self, is_reconnect: bool) -> Result<(), SessionError> {
-        let mut setup = self.cfg.setup.clone();
-        setup.resume_handle = self.handle.clone();
-        // A reopen "resumed" iff it re-sent setup carrying a stored handle, so
-        // the server can restore context. The first open is never a resume.
-        let resumed = is_reconnect && self.handle.is_some();
-        self.transport.send_text(wire::build_setup(&setup).to_string()).await?;
-        self.pending.push_back(Event::SessionOpened { is_reconnect, resumed });
-        Ok(())
+    /// Wire up the channels and spawn the driver task.
+    fn spawn<T: Transport + 'static>(
+        cfg: ClientConfig,
+        transport: T,
+        reconnect: Reconnector<T>,
+        handle: Option<String>,
+        backoff: Backoff,
+        rstate: ReconnectState,
+    ) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(CMD_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel::<Event>(EVENT_CAPACITY);
+        // Detached: the task self-terminates when the caller drops the Session
+        // (its `cmd_rx`/`events` close), after draining queued commands.
+        tokio::spawn(driver_task(
+            transport, cfg, reconnect, handle, backoff, rstate, cmd_rx, event_tx,
+        ));
+        Session { cmd_tx, events: event_rx }
     }
 
-    /// The unified event stream across reconnects. Drives the transport, parses
-    /// frames, resumes+backs-off internally on a resumable close, and returns
-    /// `None` only after a terminal [`Event::SessionClosed`].
-    ///
-    /// This method *is* the reconnect loop — its future may be parked inside a
-    /// backoff sleep or a reconnect handshake at any await point. Poll it from a
-    /// single task and to completion; do not race it against other futures or
-    /// drop/cancel it concurrently except for shutdown. Cancelling mid-reconnect
-    /// loses the pending close reason and re-counts the in-flight attempt on the
-    /// next call (it self-heals, but the terminal reason/attempt tally drift).
-    pub async fn next_event(&mut self) -> Option<Event> {
-        loop {
-            if let Some(ev) = self.pending.pop_front() {
-                return Some(ev);
-            }
-            if self.terminal {
-                return None;
-            }
-            if let Some((kind, reason)) = self.pending_reconnect.take() {
-                match self.reconnect(kind).await {
-                    // `open` queued SessionOpened { is_reconnect: true }.
-                    Ok(()) => continue,
-                    Err(()) => {
-                        self.terminal = true;
-                        return Some(Event::SessionClosed { reason });
-                    }
-                }
-            }
-
-            match self.transport.recv().await {
-                Some(Ok(bytes)) => {
-                    // Malformed frames are skipped (never fatal); the crate has
-                    // no Warning event and a bad frame must not kill the stream.
-                    if let Ok(evs) = wire::parse_server_message(&bytes) {
-                        for se in evs {
-                            self.absorb(se);
-                        }
-                    }
-                    continue;
-                }
-                Some(Err(TransportError::Closed(reason))) => {
-                    self.pending_reconnect = Some((EndKind::RemoteClose, reason));
-                    continue;
-                }
-                Some(Err(_other)) => {
-                    // Protocol/send error: resumable, reconnect transparently.
-                    self.pending_reconnect =
-                        Some((EndKind::Resumable, synth_reason("transport error")));
-                    continue;
-                }
-                None => {
-                    // Stream ended without a close frame — treat as a remote close.
-                    self.pending_reconnect =
-                        Some((EndKind::RemoteClose, synth_reason("stream ended")));
-                    continue;
-                }
-            }
-        }
+    /// The unified event stream across reconnects. Cancel-safe: it is a plain
+    /// `mpsc` receive, so racing it in a `select!` never disturbs the reconnect
+    /// loop (which runs in the driver task). Returns `None` once the task ends
+    /// (after a terminal [`Event::SessionClosed`], or once the session is
+    /// dropped).
+    pub async fn recv_event(&mut self) -> Option<Event> {
+        self.events.recv().await
     }
 
-    /// Map one parsed server event onto internal state or a surfaced [`Event`].
-    /// The resumption handle is stored (never surfaced); `setupComplete` is
-    /// internal progress; `goAway` schedules a transparent reconnect.
-    fn absorb(&mut self, se: ServerEvent) {
-        match se {
-            ServerEvent::SetupComplete => self.progressed = true,
-            ServerEvent::OutputAudio(pcm) => self.pending.push_back(Event::OutputAudio(pcm)),
-            ServerEvent::Transcript { role, text, final_ } => {
-                self.pending.push_back(Event::Transcript { role, text, final_ })
-            }
-            ServerEvent::Affect { role, label } => {
-                self.pending.push_back(Event::Affect { role, label })
-            }
-            ServerEvent::Interrupted => self.pending.push_back(Event::Interrupted),
-            ServerEvent::TurnComplete => self.pending.push_back(Event::TurnComplete),
-            ServerEvent::ToolCall { name, id, args } => {
-                self.pending.push_back(Event::ToolCall { name, id, args })
-            }
-            ServerEvent::ResumptionHandle(h) => {
-                self.handle = Some(h);
-                self.progressed = true;
-            }
-            // Don't surface goAway; finish draining this frame's events, then
-            // reconnect transparently.
-            ServerEvent::GoAway => {
-                self.pending_reconnect = Some((EndKind::Resumable, synth_reason("goAway")));
-            }
-        }
-    }
-
-    /// Record one non-progressing reconnect attempt (a failed connect, or a
-    /// connect that closed before `setupComplete`): advance the consecutive-
-    /// failure count, drop the stale handle at the threshold, and report whether
-    /// the configured attempt budget is now exhausted (→ terminal).
-    fn note_failure(&mut self) -> bool {
-        if self.rstate.on_failure() {
-            self.handle = None; // stale handle after N consecutive failures
-        }
-        matches!(self.cfg.max_reconnect_attempts, Some(max) if self.rstate.fails() >= max)
-    }
-
-    /// Perform the reconnect for a just-ended attempt: apply the
-    /// `reconnect_outcome` bookkeeping, sleep the backoff, then (re)connect —
-    /// retrying failed connects with escalating backoff and stale-handle drop —
-    /// until a fresh transport is open + `setup` re-sent, or the attempt budget
-    /// is exhausted (terminal).
-    ///
-    /// Crucially, the backoff sleep happens **before every reconnect**, not only
-    /// after a failed connect. An endpoint that accepts the WS + setup and then
-    /// closes before `setupComplete` (post-handshake reject / overload / rapid
-    /// goAway) makes `connect` *succeed* every time; sleeping only on connect
-    /// failure would hot-loop that accept-then-close forever. Sleeping up front
-    /// (with backoff advancing — it is reset only on a *progressing* close, per
-    /// `reconnect_outcome`'s `RemoteClose => Some(progressed)`) backs the storm
-    /// off exactly like kutsu's sleep-before-every-reconnect.
-    async fn reconnect(&mut self, end: EndKind) -> Result<(), ()> {
-        // Bookkeeping for the attempt that just ended (kutsu's reconnect_outcome):
-        // Resumable is always a failure; RemoteClose is success iff progress was
-        // made — otherwise a consistently-broken endpoint keeps escalating.
-        let success = matches!(end, EndKind::RemoteClose) && self.progressed;
-        self.progressed = false;
-        if success {
-            self.rstate.on_success();
-            self.backoff.reset();
-        } else if self.note_failure() {
-            return Err(());
-        }
-
-        loop {
-            // Always back off before (re)connecting — see the method doc: this
-            // is what tames an accept-then-close storm, where `connect` keeps
-            // succeeding but the session never progresses.
-            tokio::time::sleep(self.backoff.next_delay()).await;
-
-            if let Ok(t) = (self.reconnect)().await {
-                self.transport = t;
-                if self.open(true).await.is_ok() {
-                    return Ok(());
-                }
-                // setup send failed on the fresh transport: treat as a failed
-                // attempt and keep retrying.
-            }
-            if self.note_failure() {
-                return Err(());
-            }
-        }
-    }
-
-    /// Send one uplink audio frame (PCM16 @ 16 kHz). Bytes are byte-identical
-    /// to kutsu's `build_realtime_input`.
-    pub async fn send_audio(&mut self, pcm16_16k: &[i16]) -> Result<(), SessionError> {
-        self.transport.send_text(wire::build_realtime_input(pcm16_16k)).await.map_err(Into::into)
+    /// Send one uplink audio frame (PCM16 @ 16 kHz). Enqueues to the driver task
+    /// (`&self`); the task writes the byte-identical `realtime_input` frame. If
+    /// the task is reconnecting the frame is dropped there (never blocks the
+    /// caller). Returns `Err(SessionError::Closed)` once the task has ended.
+    pub async fn send_audio(&self, pcm16_16k: &[i16]) -> Result<(), SessionError> {
+        self.cmd_tx
+            .send(Command::Audio(pcm16_16k.to_vec()))
+            .await
+            .map_err(|_| SessionError::Closed)
     }
 
     /// Send a client text turn (kutsu uses this for GREET_CUE / RESUME_CUE).
-    pub async fn send_client_text(&mut self, text: &str) -> Result<(), SessionError> {
-        self.transport.send_text(wire::build_client_content(text)).await.map_err(Into::into)
+    pub async fn send_client_text(&self, text: &str) -> Result<(), SessionError> {
+        self.cmd_tx
+            .send(Command::ClientText(text.to_string()))
+            .await
+            .map_err(|_| SessionError::Closed)
     }
 
     /// Acknowledge a tool call by id (kutsu owns the tool's semantics).
-    pub async fn send_tool_response(&mut self, call_id: &str) -> Result<(), SessionError> {
-        self.transport.send_text(wire::build_tool_response(call_id)).await.map_err(Into::into)
+    pub async fn send_tool_response(&self, call_id: &str) -> Result<(), SessionError> {
+        self.cmd_tx
+            .send(Command::ToolResponse(call_id.to_string()))
+            .await
+            .map_err(|_| SessionError::Closed)
+    }
+}
+
+/// The reconnect/resumption driver, run inside a spawned task. Owns the
+/// transport and the whole lifecycle; communicates with the caller only over
+/// `cmd_rx` (in) and `events` (out).
+async fn driver_task<T: Transport>(
+    mut transport: T,
+    cfg: ClientConfig,
+    mut reconnect: Reconnector<T>,
+    mut handle: Option<String>,
+    mut backoff: Backoff,
+    mut rstate: ReconnectState,
+    mut cmd_rx: mpsc::Receiver<Command>,
+    events: mpsc::Sender<Event>,
+) {
+    let mut progressed = false;
+
+    // First open (is_reconnect: false, resumed: false).
+    if send_setup(&mut transport, &cfg, &handle).await.is_err() {
+        match reconnect_loop(
+            &mut reconnect, &mut backoff, &mut rstate, &cfg, &mut handle, false,
+            EndKind::Resumable, &mut cmd_rx, &events,
+        )
+        .await
+        {
+            Ok(t) => {
+                transport = t;
+                progressed = false;
+            }
+            Err(()) => {
+                let _ = events.send(Event::SessionClosed { reason: synth_reason("setup failed") }).await;
+                return;
+            }
+        }
+    } else if events
+        .send(Event::SessionOpened { is_reconnect: false, resumed: false })
+        .await
+        .is_err()
+    {
+        return; // caller gone
+    }
+
+    'outer: loop {
+        // --- LIVE phase: pump commands out, server frames in. ---
+        let (end, reason) = loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(c) => {
+                        if write_cmd(&mut transport, c).await.is_err() {
+                            break (EndKind::Resumable, synth_reason("send error"));
+                        }
+                    }
+                    None => return, // all command senders dropped -> caller gone
+                },
+                msg = transport.recv() => match msg {
+                    Some(Ok(bytes)) => {
+                        // Malformed frames are skipped (never fatal).
+                        if let Ok(evs) = wire::parse_server_message(&bytes) {
+                            let mut goaway = false;
+                            for se in evs {
+                                match absorb(se, &mut handle, &mut progressed) {
+                                    Absorbed::Emit(ev) => {
+                                        if events.send(ev).await.is_err() {
+                                            return; // caller gone
+                                        }
+                                    }
+                                    Absorbed::GoAway => goaway = true,
+                                    Absorbed::Ignore => {}
+                                }
+                            }
+                            if goaway {
+                                break (EndKind::Resumable, synth_reason("goAway"));
+                            }
+                        }
+                    }
+                    Some(Err(TransportError::Closed(r))) => break (EndKind::RemoteClose, r),
+                    Some(Err(_)) => break (EndKind::Resumable, synth_reason("transport error")),
+                    None => break (EndKind::RemoteClose, synth_reason("stream ended")),
+                },
+            }
+        };
+
+        // --- RECONNECT phase (transparent). ---
+        match reconnect_loop(
+            &mut reconnect, &mut backoff, &mut rstate, &cfg, &mut handle, progressed,
+            end, &mut cmd_rx, &events,
+        )
+        .await
+        {
+            Ok(t) => {
+                transport = t;
+                progressed = false;
+                continue 'outer;
+            }
+            Err(()) => {
+                let _ = events.send(Event::SessionClosed { reason }).await;
+                return;
+            }
+        }
+    }
+}
+
+/// What one parsed server event maps to.
+enum Absorbed {
+    Emit(Event),
+    GoAway,
+    Ignore,
+}
+
+/// Map one parsed server event onto internal state or a surfaced [`Event`].
+/// The resumption handle is stored (never surfaced); `setupComplete` is internal
+/// progress; `goAway` schedules a transparent reconnect.
+fn absorb(se: ServerEvent, handle: &mut Option<String>, progressed: &mut bool) -> Absorbed {
+    match se {
+        ServerEvent::SetupComplete => {
+            *progressed = true;
+            Absorbed::Ignore
+        }
+        ServerEvent::OutputAudio(pcm) => Absorbed::Emit(Event::OutputAudio(pcm)),
+        ServerEvent::Transcript { role, text, final_ } => {
+            Absorbed::Emit(Event::Transcript { role, text, final_ })
+        }
+        ServerEvent::Affect { role, label } => Absorbed::Emit(Event::Affect { role, label }),
+        ServerEvent::Interrupted => Absorbed::Emit(Event::Interrupted),
+        ServerEvent::TurnComplete => Absorbed::Emit(Event::TurnComplete),
+        ServerEvent::ToolCall { name, id, args } => Absorbed::Emit(Event::ToolCall { name, id, args }),
+        ServerEvent::ResumptionHandle(h) => {
+            *handle = Some(h);
+            *progressed = true;
+            Absorbed::Ignore
+        }
+        ServerEvent::GoAway => Absorbed::GoAway,
+    }
+}
+
+/// Send `setup` (carrying the latest stored handle) on `transport`.
+async fn send_setup<T: Transport>(
+    transport: &mut T,
+    cfg: &ClientConfig,
+    handle: &Option<String>,
+) -> Result<(), TransportError> {
+    let mut setup = cfg.setup.clone();
+    setup.resume_handle = handle.clone();
+    transport.send_text(wire::build_setup(&setup).to_string()).await
+}
+
+/// Perform the byte-identical transport write for one outbound command.
+async fn write_cmd<T: Transport>(transport: &mut T, cmd: Command) -> Result<(), TransportError> {
+    match cmd {
+        Command::Audio(pcm) => transport.send_text(wire::build_realtime_input(&pcm)).await,
+        Command::ClientText(t) => transport.send_text(wire::build_client_content(&t)).await,
+        Command::ToolResponse(id) => transport.send_text(wire::build_tool_response(&id)).await,
+    }
+}
+
+/// Record one non-progressing reconnect attempt: advance the consecutive-failure
+/// count, drop the stale handle at the threshold, and report whether the
+/// configured attempt budget is now exhausted (→ terminal).
+fn note_failure(rstate: &mut ReconnectState, cfg: &ClientConfig, handle: &mut Option<String>) -> bool {
+    if rstate.on_failure() {
+        *handle = None; // stale handle after N consecutive failures
+    }
+    matches!(cfg.max_reconnect_attempts, Some(max) if rstate.fails() >= max)
+}
+
+/// Reconnect for a just-ended attempt: apply the bookkeeping, then back off and
+/// (re)connect — retrying with escalating backoff and stale-handle drop — until
+/// a fresh transport is open + `setup` re-sent (emitting
+/// `SessionOpened { is_reconnect: true, resumed }`), or the attempt budget is
+/// exhausted (terminal → `Err`).
+///
+/// Crucially, throughout the backoff it **drains and discards** inbound commands
+/// (`drain_backoff`): audio queued during the outage is stale, and draining it
+/// keeps the caller's bounded command channel from blocking — this is what
+/// prevents caller audio traffic from starving the reconnect. The backoff sleep
+/// itself runs to completion regardless of how many commands arrive.
+async fn reconnect_loop<T: Transport>(
+    reconnect: &mut Reconnector<T>,
+    backoff: &mut Backoff,
+    rstate: &mut ReconnectState,
+    cfg: &ClientConfig,
+    handle: &mut Option<String>,
+    progressed: bool,
+    end: EndKind,
+    cmd_rx: &mut mpsc::Receiver<Command>,
+    events: &mpsc::Sender<Event>,
+) -> Result<T, ()> {
+    // Bookkeeping for the attempt that just ended: Resumable is always a
+    // failure; RemoteClose is success iff progress was made.
+    let success = matches!(end, EndKind::RemoteClose) && progressed;
+    if success {
+        rstate.on_success();
+        backoff.reset();
+    } else if note_failure(rstate, cfg, handle) {
+        return Err(());
+    }
+
+    loop {
+        // Back off before (re)connecting, draining stale commands meanwhile.
+        if let ControlFlow::Break(()) = drain_backoff(cmd_rx, backoff.next_delay()).await {
+            return Err(()); // caller gone
+        }
+
+        if let Ok(mut t) = reconnect().await {
+            if send_setup(&mut t, cfg, handle).await.is_ok() {
+                // A reopen "resumed" iff it re-sent setup carrying a stored handle.
+                let resumed = handle.is_some();
+                if events
+                    .send(Event::SessionOpened { is_reconnect: true, resumed })
+                    .await
+                    .is_ok()
+                {
+                    return Ok(t);
+                }
+                return Err(()); // caller gone
+            }
+            // setup send failed on the fresh transport: treat as a failed attempt.
+        }
+        if note_failure(rstate, cfg, handle) {
+            return Err(());
+        }
+    }
+}
+
+/// Sleep `delay` while draining (discarding) inbound commands, so the caller's
+/// bounded command channel never blocks during an outage. The `sleep` is pinned
+/// so draining commands does not restart the backoff. Returns `Break` if the
+/// command channel closed (caller gone).
+async fn drain_backoff(cmd_rx: &mut mpsc::Receiver<Command>, delay: Duration) -> ControlFlow<()> {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return ControlFlow::Continue(()),
+            cmd = cmd_rx.recv() => {
+                if cmd.is_none() {
+                    return ControlFlow::Break(());
+                }
+                // Discard the stale command; keep waiting out the backoff.
+            }
+        }
     }
 }
 
@@ -466,8 +608,7 @@ mod tests {
         }
     }
 
-    /// A reconnector that always fails (unused by tests that never reconnect,
-    /// or used to drive the terminal path).
+    /// A reconnector that always fails.
     fn no_reconnect() -> Reconnector<FakeTransport> {
         Box::new(|| {
             Box::pin(async {
@@ -489,9 +630,9 @@ mod tests {
 
     /// A reconnector that yields `n` accept-then-close transports (each accepts
     /// `setup`, then closes before any `setupComplete` — i.e. no progress),
-    /// then fails. Models a post-handshake-reject / overload storm.
+    /// then fails.
     fn accept_then_close(n: usize) -> Reconnector<FakeTransport> {
-        let mut queue: VecDeque<FakeTransport> = (0..n)
+        let mut queue: std::collections::VecDeque<FakeTransport> = (0..n)
             .map(|_| {
                 let mut t = FakeTransport::new(false);
                 t.push_close(1013, "overloaded");
@@ -506,13 +647,25 @@ mod tests {
         })
     }
 
+    /// Poll `sent` until it has at least `n` frames (the driver task writes
+    /// asynchronously), or panic after a bounded number of yields.
+    async fn wait_for_sent(sent: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, n: usize) {
+        for _ in 0..1000 {
+            if sent.lock().unwrap().len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("timed out waiting for {n} sent frames (have {})", sent.lock().unwrap().len());
+    }
+
     #[tokio::test]
     async fn first_open_emits_session_opened_and_sends_setup() {
         let fake = FakeTransport::new(true);
         let sent = fake.sent.clone();
-        let mut s = Session::connect_with_reconnector(cfg(), fake, no_reconnect()).await.unwrap();
+        let mut s = Session::connect_with_transport(cfg(), fake, no_reconnect()).await.unwrap();
 
-        let ev = s.next_event().await;
+        let ev = s.recv_event().await;
         assert!(matches!(ev, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
         // setup was captured on the fake as the first outgoing frame.
         assert!(sent.lock().unwrap()[0].contains("\"setup\""));
@@ -537,47 +690,39 @@ mod tests {
         fake.push_data(br#"{"serverContent":{"turnComplete":true}}"#.to_vec());
         fake.push_data(br#"{"serverContent":{"interrupted":true}}"#.to_vec());
 
-        let mut s = Session::connect_with_reconnector(cfg(), fake, no_reconnect()).await.unwrap();
+        let mut s = Session::connect_with_transport(cfg(), fake, no_reconnect()).await.unwrap();
 
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
-        // setupComplete surfaces nothing; audio is next.
-        assert!(matches!(s.next_event().await, Some(Event::OutputAudio(a)) if a == vec![0, 1, 2, 3]));
+        assert!(matches!(s.recv_event().await, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
+        assert!(matches!(s.recv_event().await, Some(Event::OutputAudio(a)) if a == vec![0, 1, 2, 3]));
         assert!(matches!(
-            s.next_event().await,
+            s.recv_event().await,
             Some(Event::Transcript { role: Role::Model, text, final_: true }) if text == "Hi"
         ));
         assert!(matches!(
-            s.next_event().await,
+            s.recv_event().await,
             Some(Event::ToolCall { name, id, .. }) if name == "end_call" && id == "c1"
         ));
-        assert!(matches!(s.next_event().await, Some(Event::TurnComplete)));
-        assert!(matches!(s.next_event().await, Some(Event::Interrupted)));
+        assert!(matches!(s.recv_event().await, Some(Event::TurnComplete)));
+        assert!(matches!(s.recv_event().await, Some(Event::Interrupted)));
     }
 
     #[tokio::test(start_paused = true)]
     async fn resumption_handle_stored_not_surfaced_then_replayed_on_reconnect() {
-        // Script 1: setupComplete, a fresh handle, then a resumable close.
         let mut first = FakeTransport::new(false);
         first.push_data(br#"{"setupComplete":{}}"#.to_vec());
         first.push_data(br#"{"sessionResumptionUpdate":{"newHandle":"H1"}}"#.to_vec());
         first.push_close(1011, "server restart");
 
-        // Script 2: the reopened connection. Its captured `sent` must show the
-        // setup carrying the stored handle "H1".
         let second = FakeTransport::new(true);
         let second_sent = second.sent.clone();
 
-        let mut s =
-            Session::connect_with_reconnector(cfg(), first, once(second)).await.unwrap();
+        let mut s = Session::connect_with_transport(cfg(), first, once(second)).await.unwrap();
 
-        // First open.
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
-        // The handle update surfaces nothing on its own; the next event is the
-        // transparent reopen after the scripted close. It carried the stored
-        // handle "H1", so `resumed` is true (context preserved server-side).
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: true, resumed: true })));
+        assert!(matches!(s.recv_event().await, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
+        // The handle update surfaces nothing; the next event is the transparent
+        // reopen. It re-sent setup carrying "H1", so `resumed` is true.
+        assert!(matches!(s.recv_event().await, Some(Event::SessionOpened { is_reconnect: true, resumed: true })));
 
-        // The reopen re-sent setup carrying the stored handle.
         let setup = &second_sent.lock().unwrap()[0];
         assert!(setup.contains("\"setup\""));
         assert!(setup.contains("H1"), "reopened setup must carry the stored handle: {setup}");
@@ -587,10 +732,12 @@ mod tests {
     async fn send_audio_is_byte_identical_to_kutsu() {
         let fake = FakeTransport::new(true);
         let sent = fake.sent.clone();
-        let mut s = Session::connect_with_reconnector(cfg(), fake, no_reconnect()).await.unwrap();
-        let _ = s.next_event().await; // SessionOpened
+        let mut s = Session::connect_with_transport(cfg(), fake, no_reconnect()).await.unwrap();
+        let _ = s.recv_event().await; // SessionOpened (setup already sent)
 
         s.send_audio(&[0i16, 1i16]).await.unwrap();
+        // The driver task writes the enqueued command asynchronously.
+        wait_for_sent(&sent, 2).await;
 
         assert_eq!(
             sent.lock().unwrap().last().unwrap(),
@@ -604,60 +751,85 @@ mod tests {
         fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
         fake.push_close(1011, "boom");
 
-        // Bound reconnection so it terminates deterministically: one failed
-        // connect is enough to exhaust the budget.
         let mut c = cfg();
         c.max_reconnect_attempts = Some(1);
-        // No reconnector transport available -> reconnection is exhausted.
-        let mut s = Session::connect_with_reconnector(c, fake, no_reconnect()).await.unwrap();
+        let mut s = Session::connect_with_transport(c, fake, no_reconnect()).await.unwrap();
 
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
-        // Drives: setupComplete -> close -> failed reconnects -> terminal.
-        match s.next_event().await {
+        assert!(matches!(s.recv_event().await, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
+        match s.recv_event().await {
             Some(Event::SessionClosed { reason }) => assert_eq!(reason.code, 1011),
             other => panic!("expected SessionClosed, got {other:?}"),
         }
-        // Stream has ended.
-        assert!(s.next_event().await.is_none());
+        assert!(s.recv_event().await.is_none());
     }
 
     #[tokio::test(start_paused = true)]
     async fn accept_then_close_storm_backs_off_and_terminates_at_the_bound() {
-        // Every connection accepts setup then closes before `setupComplete` —
-        // no progress. This must NOT hot-loop: each reconnect backs off (the
-        // backoff advances because a no-progress close never resets it), and
-        // with a bound it terminates after exactly `n` non-progressing attempts.
         let mut initial = FakeTransport::new(false);
         initial.push_close(1013, "overloaded");
 
         let mut c = cfg();
         c.max_reconnect_attempts = Some(3);
-        // n-1 reconnect transports: initial + 2 reopens = 3 no-progress closes.
         let mut s =
-            Session::connect_with_reconnector(c, initial, accept_then_close(2)).await.unwrap();
+            Session::connect_with_transport(c, initial, accept_then_close(2)).await.unwrap();
 
         let start = tokio::time::Instant::now();
 
-        // First open, then two transparent reopens (each accept-then-close),
-        // then the bound is hit → terminal SessionClosed → None.
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
-        // Each reopen is a no-progress accept-then-close with no stored handle,
-        // so `resumed` stays false throughout.
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: true, resumed: false })));
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: true, resumed: false })));
-        match s.next_event().await {
+        assert!(matches!(s.recv_event().await, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
+        // Each reopen is a no-progress accept-then-close with no stored handle.
+        assert!(matches!(s.recv_event().await, Some(Event::SessionOpened { is_reconnect: true, resumed: false })));
+        assert!(matches!(s.recv_event().await, Some(Event::SessionOpened { is_reconnect: true, resumed: false })));
+        match s.recv_event().await {
             Some(Event::SessionClosed { reason }) => assert_eq!(reason.code, 1013),
             other => panic!("expected SessionClosed after the bound, got {other:?}"),
         }
-        assert!(s.next_event().await.is_none());
+        assert!(s.recv_event().await.is_none());
 
-        // Backoff advanced across reopens (300ms + 600ms), not a zero-delay
-        // storm and not a constant base delay (which would total 600ms).
         assert!(
             start.elapsed() >= std::time::Duration::from_millis(800),
             "reconnects must back off with an advancing delay, elapsed = {:?}",
             start.elapsed()
         );
+    }
+
+    /// The regression the redesign fixes: while the session is reconnecting
+    /// (transport closed, backoff pending), the caller keeps sending audio AND
+    /// polling events. With the reconnect owned by the driver task, caller
+    /// traffic can no longer cancel/starve the backoff — the reopen completes
+    /// and `SessionOpened { is_reconnect: true }` is delivered. (Under the old
+    /// caller-driven `next_event`, the ~20 ms audio arm cancelled the backoff on
+    /// every frame and the reconnect never completed.)
+    #[tokio::test(start_paused = true)]
+    async fn continuous_audio_does_not_starve_reconnect() {
+        let mut first = FakeTransport::new(false);
+        first.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        first.push_close(1011, "server restart");
+        let second = FakeTransport::new(true); // stays open after reopen
+        let mut s = Session::connect_with_transport(cfg(), first, once(second)).await.unwrap();
+
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened { is_reconnect: false, resumed: false })
+        ));
+
+        // Simulate continuous ~20 ms uplink while awaiting the reopen: enqueue a
+        // frame, then poll for an event with a short timeout, repeatedly. The
+        // send + recv are sequential (mirrors kutsu's select! where the send runs
+        // in the audio-arm body after recv_event resolves), so no borrow clash.
+        let mut got_reopen = false;
+        for _ in 0..2000 {
+            let _ = s.send_audio(&[0i16; 160]).await;
+            match tokio::time::timeout(Duration::from_millis(20), s.recv_event()).await {
+                Ok(Some(Event::SessionOpened { is_reconnect: true, .. })) => {
+                    got_reopen = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {} // timeout: keep sending audio, keep waiting
+            }
+        }
+        assert!(got_reopen, "reconnect must complete despite continuous audio traffic");
     }
 
     #[test]

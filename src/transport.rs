@@ -25,8 +25,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::types::{CloseReason, Model};
 
 /// The unified WebSocket stream type, identical for the direct and proxied
-/// connect paths.
-type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// connect paths. Public so a caller (e.g. kutsu's `net_check` preflight) can
+/// drive raw ping/pong RTT on it without re-implementing the connect path.
+pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Errors from establishing or driving a [`Transport`].
 #[derive(Debug)]
@@ -65,12 +66,20 @@ impl std::error::Error for TransportError {}
 /// the raw bytes for the caller to parse. A `Close` frame surfaces as
 /// `Some(Err(TransportError::Closed(reason)))` exactly once, after which the
 /// stream ends (`recv` returns `None` on subsequent calls).
-pub trait Transport {
+/// `Send` supertrait + `Send` futures: the session driver owns a `Transport`
+/// inside a `tokio::spawn`ed task, so both the transport and every I/O future it
+/// produces must be `Send`.
+pub trait Transport: Send {
     /// Send a text frame (the setup/client-content JSON messages).
-    async fn send_text(&mut self, s: String) -> Result<(), TransportError>;
+    fn send_text(
+        &mut self,
+        s: String,
+    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
     /// Receive the next server frame's raw bytes, or `None` when the stream
     /// has ended (after a close, or the underlying connection dropped).
-    async fn recv(&mut self) -> Option<Result<Vec<u8>, TransportError>>;
+    fn recv(
+        &mut self,
+    ) -> impl std::future::Future<Output = Option<Result<Vec<u8>, TransportError>>> + Send;
 }
 
 /// HTTP CONNECT proxy credentials, as needed to reach Gemini Live from a
@@ -98,7 +107,9 @@ fn ensure_crypto_provider() {
 
 /// Build the `BidiGenerateContent` WebSocket endpoint URL for `model`,
 /// pinned to its API version, carrying `api_key` as the `key` query param.
-fn endpoint_url(model: Model, api_key: &str) -> String {
+/// Public so callers probe the exact URL the session will use (single source
+/// of truth for the endpoint + per-model API version).
+pub fn endpoint_url(model: Model, api_key: &str) -> String {
     format!(
         "wss://generativelanguage.googleapis.com/ws/\
          google.ai.generativelanguage.{ver}.GenerativeService.BidiGenerateContent?key={key}",
@@ -108,7 +119,9 @@ fn endpoint_url(model: Model, api_key: &str) -> String {
 }
 
 /// Open a WebSocket connection to `url`, tunneling through `proxy` when present.
-async fn connect_ws(proxy: Option<&ProxyConfig>, url: &str) -> Result<Ws, TransportError> {
+/// Public so a caller (kutsu's `net_check` preflight) can obtain the raw stream
+/// for ping/pong RTT without re-implementing the proxy/TLS connect path.
+pub async fn connect_ws(proxy: Option<&ProxyConfig>, url: &str) -> Result<WsStream, TransportError> {
     ensure_crypto_provider();
     match proxy {
         None => {
@@ -121,7 +134,7 @@ async fn connect_ws(proxy: Option<&ProxyConfig>, url: &str) -> Result<Ws, Transp
     }
 }
 
-async fn connect_via_proxy(proxy: &ProxyConfig, url: &str) -> Result<Ws, TransportError> {
+async fn connect_via_proxy(proxy: &ProxyConfig, url: &str) -> Result<WsStream, TransportError> {
     let (target_host, target_port) = target_host_port(url)?;
     let (proxy_host, proxy_port) = parse_host_port(&proxy.url, 80)?;
 
@@ -199,7 +212,7 @@ fn parse_host_port(s: &str, default_port: u16) -> Result<(String, u16), Transpor
 /// The real `tokio-tungstenite` transport: a live WebSocket to Gemini Live,
 /// optionally tunneled through an HTTP CONNECT proxy.
 pub struct WsTransport {
-    ws: Ws,
+    ws: WsStream,
 }
 
 impl WsTransport {
@@ -217,37 +230,46 @@ impl WsTransport {
 }
 
 impl Transport for WsTransport {
-    async fn send_text(&mut self, s: String) -> Result<(), TransportError> {
+    fn send_text(
+        &mut self,
+        s: String,
+    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send {
         use futures_util::SinkExt;
-        self.ws
-            .send(Message::Text(s.into()))
-            .await
-            .map_err(|e| TransportError::Send(e.to_string()))
+        async move {
+            self.ws
+                .send(Message::Text(s.into()))
+                .await
+                .map_err(|e| TransportError::Send(e.to_string()))
+        }
     }
 
-    async fn recv(&mut self) -> Option<Result<Vec<u8>, TransportError>> {
+    fn recv(
+        &mut self,
+    ) -> impl std::future::Future<Output = Option<Result<Vec<u8>, TransportError>>> + Send {
         use futures_util::StreamExt;
-        loop {
-            match self.ws.next().await? {
-                // Gemini Live sends server messages as binary WS frames (JSON
-                // bytes), not text — accept both.
-                Ok(Message::Text(t)) => return Some(Ok(t.as_bytes().to_vec())),
-                Ok(Message::Binary(b)) => return Some(Ok(b.to_vec())),
-                Ok(Message::Close(frame)) => {
-                    let reason = match frame {
-                        Some(cf) => {
-                            tracing::warn!(code = %cf.code, reason = %cf.reason, "gemini: server closed WS");
-                            CloseReason { code: cf.code.into(), reason: cf.reason.to_string() }
-                        }
-                        None => {
-                            tracing::warn!("gemini: server closed WS (no close frame)");
-                            CloseReason { code: 0, reason: String::new() }
-                        }
-                    };
-                    return Some(Err(TransportError::Closed(reason)));
+        async move {
+            loop {
+                match self.ws.next().await? {
+                    // Gemini Live sends server messages as binary WS frames (JSON
+                    // bytes), not text — accept both.
+                    Ok(Message::Text(t)) => return Some(Ok(t.as_bytes().to_vec())),
+                    Ok(Message::Binary(b)) => return Some(Ok(b.to_vec())),
+                    Ok(Message::Close(frame)) => {
+                        let reason = match frame {
+                            Some(cf) => {
+                                tracing::warn!(code = %cf.code, reason = %cf.reason, "gemini: server closed WS");
+                                CloseReason { code: cf.code.into(), reason: cf.reason.to_string() }
+                            }
+                            None => {
+                                tracing::warn!("gemini: server closed WS (no close frame)");
+                                CloseReason { code: 0, reason: String::new() }
+                            }
+                        };
+                        return Some(Err(TransportError::Closed(reason)));
+                    }
+                    Ok(_) => continue, // ignore ping/pong
+                    Err(e) => return Some(Err(TransportError::Protocol(e.to_string()))),
                 }
-                Ok(_) => continue, // ignore ping/pong
-                Err(e) => return Some(Err(TransportError::Protocol(e.to_string()))),
             }
         }
     }
@@ -294,20 +316,29 @@ impl FakeTransport {
 }
 
 impl Transport for FakeTransport {
-    async fn send_text(&mut self, s: String) -> Result<(), TransportError> {
+    fn send_text(
+        &mut self,
+        s: String,
+    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send {
         self.sent.lock().unwrap().push(s);
-        Ok(())
+        async { Ok(()) }
     }
 
-    async fn recv(&mut self) -> Option<Result<Vec<u8>, TransportError>> {
-        match self.incoming.pop_front() {
-            Some(FakeFrame::Data(b)) => Some(Ok(b)),
-            Some(FakeFrame::Close(reason)) => {
-                tracing::warn!(code = %reason.code, reason = %reason.reason, "fake: scripted WS close");
-                Some(Err(TransportError::Closed(reason)))
+    fn recv(
+        &mut self,
+    ) -> impl std::future::Future<Output = Option<Result<Vec<u8>, TransportError>>> + Send {
+        let next = self.incoming.pop_front();
+        let pending = self.pending_when_empty;
+        async move {
+            match next {
+                Some(FakeFrame::Data(b)) => Some(Ok(b)),
+                Some(FakeFrame::Close(reason)) => {
+                    tracing::warn!(code = %reason.code, reason = %reason.reason, "fake: scripted WS close");
+                    Some(Err(TransportError::Closed(reason)))
+                }
+                None if pending => std::future::pending().await,
+                None => None,
             }
-            None if self.pending_when_empty => std::future::pending().await,
-            None => None,
         }
     }
 }
