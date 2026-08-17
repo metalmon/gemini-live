@@ -65,8 +65,12 @@ pub struct ClientConfig {
 pub enum Event {
     /// A connection is open and `setup` has been sent. `is_reconnect` is
     /// `false` for the very first open, `true` for every transparent resume —
-    /// the caller's cue to drain stale uplink / send a resume cue.
-    SessionOpened { is_reconnect: bool },
+    /// the caller's cue to drain stale uplink / send a resume cue. `resumed`
+    /// says whether that reopen re-sent `setup` carrying a stored resumption
+    /// handle: `true` means context was preserved server-side (the model can
+    /// restore it itself), `false` means the reopen was fresh and context was
+    /// lost. The first open is always `is_reconnect: false, resumed: false`.
+    SessionOpened { is_reconnect: bool, resumed: bool },
     /// Terminal: reconnection was exhausted or the close is unrecoverable. The
     /// stream ends after this (`next_event` returns `None` thereafter).
     SessionClosed { reason: CloseReason },
@@ -206,8 +210,11 @@ impl<T: Transport> Session<T> {
     async fn open(&mut self, is_reconnect: bool) -> Result<(), SessionError> {
         let mut setup = self.cfg.setup.clone();
         setup.resume_handle = self.handle.clone();
+        // A reopen "resumed" iff it re-sent setup carrying a stored handle, so
+        // the server can restore context. The first open is never a resume.
+        let resumed = is_reconnect && self.handle.is_some();
         self.transport.send_text(wire::build_setup(&setup).to_string()).await?;
-        self.pending.push_back(Event::SessionOpened { is_reconnect });
+        self.pending.push_back(Event::SessionOpened { is_reconnect, resumed });
         Ok(())
     }
 
@@ -506,7 +513,7 @@ mod tests {
         let mut s = Session::connect_with_reconnector(cfg(), fake, no_reconnect()).await.unwrap();
 
         let ev = s.next_event().await;
-        assert!(matches!(ev, Some(Event::SessionOpened { is_reconnect: false })));
+        assert!(matches!(ev, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
         // setup was captured on the fake as the first outgoing frame.
         assert!(sent.lock().unwrap()[0].contains("\"setup\""));
     }
@@ -532,7 +539,7 @@ mod tests {
 
         let mut s = Session::connect_with_reconnector(cfg(), fake, no_reconnect()).await.unwrap();
 
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false })));
+        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
         // setupComplete surfaces nothing; audio is next.
         assert!(matches!(s.next_event().await, Some(Event::OutputAudio(a)) if a == vec![0, 1, 2, 3]));
         assert!(matches!(
@@ -564,10 +571,11 @@ mod tests {
             Session::connect_with_reconnector(cfg(), first, once(second)).await.unwrap();
 
         // First open.
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false })));
+        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
         // The handle update surfaces nothing on its own; the next event is the
-        // transparent reopen after the scripted close.
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: true })));
+        // transparent reopen after the scripted close. It carried the stored
+        // handle "H1", so `resumed` is true (context preserved server-side).
+        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: true, resumed: true })));
 
         // The reopen re-sent setup carrying the stored handle.
         let setup = &second_sent.lock().unwrap()[0];
@@ -603,7 +611,7 @@ mod tests {
         // No reconnector transport available -> reconnection is exhausted.
         let mut s = Session::connect_with_reconnector(c, fake, no_reconnect()).await.unwrap();
 
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false })));
+        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
         // Drives: setupComplete -> close -> failed reconnects -> terminal.
         match s.next_event().await {
             Some(Event::SessionClosed { reason }) => assert_eq!(reason.code, 1011),
@@ -632,9 +640,11 @@ mod tests {
 
         // First open, then two transparent reopens (each accept-then-close),
         // then the bound is hit → terminal SessionClosed → None.
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false })));
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: true })));
-        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: true })));
+        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: false, resumed: false })));
+        // Each reopen is a no-progress accept-then-close with no stored handle,
+        // so `resumed` stays false throughout.
+        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: true, resumed: false })));
+        assert!(matches!(s.next_event().await, Some(Event::SessionOpened { is_reconnect: true, resumed: false })));
         match s.next_event().await {
             Some(Event::SessionClosed { reason }) => assert_eq!(reason.code, 1013),
             other => panic!("expected SessionClosed after the bound, got {other:?}"),
