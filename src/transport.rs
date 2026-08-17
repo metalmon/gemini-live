@@ -121,7 +121,10 @@ pub fn endpoint_url(model: Model, api_key: &str) -> String {
 /// Open a WebSocket connection to `url`, tunneling through `proxy` when present.
 /// Public so a caller (kutsu's `net_check` preflight) can obtain the raw stream
 /// for ping/pong RTT without re-implementing the proxy/TLS connect path.
-pub async fn connect_ws(proxy: Option<&ProxyConfig>, url: &str) -> Result<WsStream, TransportError> {
+pub async fn connect_ws(
+    proxy: Option<&ProxyConfig>,
+    url: &str,
+) -> Result<WsStream, TransportError> {
     ensure_crypto_provider();
     match proxy {
         None => {
@@ -140,7 +143,11 @@ async fn connect_via_proxy(proxy: &ProxyConfig, url: &str) -> Result<WsStream, T
 
     let mut stream = TcpStream::connect((proxy_host.as_str(), proxy_port))
         .await
-        .map_err(|e| TransportError::Connect(format!("proxy TCP connect to {proxy_host}:{proxy_port}: {e}")))?;
+        .map_err(|e| {
+            TransportError::Connect(format!(
+                "proxy TCP connect to {proxy_host}:{proxy_port}: {e}"
+            ))
+        })?;
 
     match (proxy.user.as_deref(), proxy.password.as_deref()) {
         (Some(user), Some(password)) => {
@@ -237,7 +244,7 @@ impl Transport for WsTransport {
         use futures_util::SinkExt;
         async move {
             self.ws
-                .send(Message::Text(s.into()))
+                .send(Message::Text(s))
                 .await
                 .map_err(|e| TransportError::Send(e.to_string()))
         }
@@ -258,11 +265,17 @@ impl Transport for WsTransport {
                         let reason = match frame {
                             Some(cf) => {
                                 tracing::warn!(code = %cf.code, reason = %cf.reason, "gemini: server closed WS");
-                                CloseReason { code: cf.code.into(), reason: cf.reason.to_string() }
+                                CloseReason {
+                                    code: cf.code.into(),
+                                    reason: cf.reason.to_string(),
+                                }
                             }
                             None => {
                                 tracing::warn!("gemini: server closed WS (no close frame)");
-                                CloseReason { code: 0, reason: String::new() }
+                                CloseReason {
+                                    code: 0,
+                                    reason: String::new(),
+                                }
                             }
                         };
                         return Some(Err(TransportError::Closed(reason)));
@@ -301,7 +314,11 @@ impl FakeTransport {
     /// A transport with no scripted frames; `recv()` ends the stream
     /// immediately (or pends forever, per `pending_when_empty`).
     pub fn new(pending_when_empty: bool) -> Self {
-        Self { incoming: VecDeque::new(), sent: Arc::new(Mutex::new(Vec::new())), pending_when_empty }
+        Self {
+            incoming: VecDeque::new(),
+            sent: Arc::new(Mutex::new(Vec::new())),
+            pending_when_empty,
+        }
     }
 
     /// Queue a data frame to be returned by a future `recv()`.
@@ -311,7 +328,10 @@ impl FakeTransport {
 
     /// Queue a close event to be returned by a future `recv()`.
     pub fn push_close(&mut self, code: u16, reason: impl Into<String>) {
-        self.incoming.push_back(FakeFrame::Close(CloseReason { code, reason: reason.into() }));
+        self.incoming.push_back(FakeFrame::Close(CloseReason {
+            code,
+            reason: reason.into(),
+        }));
     }
 }
 
@@ -403,7 +423,10 @@ mod tests {
         let mut t = FakeTransport::new(false);
         t.send_text("hello".into()).await.unwrap();
         t.send_text("world".into()).await.unwrap();
-        assert_eq!(&*t.sent.lock().unwrap(), &["hello".to_string(), "world".to_string()]);
+        assert_eq!(
+            &*t.sent.lock().unwrap(),
+            &["hello".to_string(), "world".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -431,6 +454,9 @@ mod tests {
         assert_eq!(t.recv().await.unwrap().unwrap(), b"only");
         // Queue is now empty; recv() must pend rather than return None.
         let pend = tokio::time::timeout(std::time::Duration::from_millis(20), t.recv()).await;
-        assert!(pend.is_err(), "recv() should still be pending, not resolved");
+        assert!(
+            pend.is_err(),
+            "recv() should still be pending, not resolved"
+        );
     }
 }

@@ -8,7 +8,7 @@
 //!
 //! The layers are populated task-by-task per the kutsu implementation plan.
 
+pub mod session;
+pub mod transport;
 pub mod types;
 pub mod wire;
-pub mod transport;
-pub mod session;

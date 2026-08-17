@@ -74,7 +74,11 @@ pub enum ServerEvent {
     /// 24kHz PCM16 output audio samples (one `inlineData` part).
     OutputAudio(Vec<i16>),
     /// An input or output transcription delta.
-    Transcript { role: Role, text: String, final_: bool },
+    Transcript {
+        role: Role,
+        text: String,
+        final_: bool,
+    },
     /// An affective-dialog emotion annotation (native-audio only).
     Affect { role: Role, label: AffectLabel },
     /// The model's turn was interrupted by callee speech (barge-in).
@@ -82,7 +86,11 @@ pub enum ServerEvent {
     /// The model's turn finished.
     TurnComplete,
     /// A function/tool call the model wants the client to execute.
-    ToolCall { name: String, id: String, args: serde_json::Value },
+    ToolCall {
+        name: String,
+        id: String,
+        args: serde_json::Value,
+    },
     /// A fresh session-resumption handle to remember for reconnect.
     ResumptionHandle(String),
     /// The server is about to close the connection (session limit, etc);
@@ -138,14 +146,20 @@ mod tests {
 
     #[test]
     fn native_audio_model_id_and_version() {
-        assert_eq!(Model::NativeAudio.model_id(), "gemini-2.5-flash-native-audio-latest");
+        assert_eq!(
+            Model::NativeAudio.model_id(),
+            "gemini-2.5-flash-native-audio-latest"
+        );
         assert_eq!(Model::NativeAudio.api_version(), "v1alpha");
         assert!(Model::NativeAudio.is_native());
     }
 
     #[test]
     fn half_cascade_model_id_and_version() {
-        assert_eq!(Model::HalfCascade.model_id(), "gemini-3.1-flash-live-preview");
+        assert_eq!(
+            Model::HalfCascade.model_id(),
+            "gemini-3.1-flash-live-preview"
+        );
         assert_eq!(Model::HalfCascade.api_version(), "v1beta");
         assert!(!Model::HalfCascade.is_native());
     }

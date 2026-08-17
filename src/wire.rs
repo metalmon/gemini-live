@@ -37,7 +37,10 @@ fn decode_pcm16(b64: &str) -> Result<Vec<i16>, WireError> {
         .or_else(|_| URL_SAFE.decode(b64))
         .or_else(|_| URL_SAFE_NO_PAD.decode(b64))
         .map_err(|e| WireError(format!("bad base64 audio: {e}")))?;
-    Ok(bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect())
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect())
 }
 
 /// Parse one server WebSocket frame (binary or text, UTF-8 JSON either way)
@@ -79,42 +82,76 @@ pub fn parse_server_message(bytes: &[u8]) -> Result<Vec<ServerEvent>, WireError>
                 }
             }
         }
-        if let Some(t) =
-            sc.get("outputTranscription").and_then(|t| t.get("text")).and_then(|t| t.as_str())
+        if let Some(t) = sc
+            .get("outputTranscription")
+            .and_then(|t| t.get("text"))
+            .and_then(|t| t.as_str())
         {
             let final_ = sc
                 .pointer("/outputTranscription/finished")
                 .and_then(|f| f.as_bool())
                 .unwrap_or(false);
-            out.push(ServerEvent::Transcript { role: Role::Model, text: t.to_string(), final_ });
+            out.push(ServerEvent::Transcript {
+                role: Role::Model,
+                text: t.to_string(),
+                final_,
+            });
         }
-        if let Some(t) =
-            sc.get("inputTranscription").and_then(|t| t.get("text")).and_then(|t| t.as_str())
+        if let Some(t) = sc
+            .get("inputTranscription")
+            .and_then(|t| t.get("text"))
+            .and_then(|t| t.as_str())
         {
             let final_ = sc
                 .pointer("/inputTranscription/finished")
                 .and_then(|f| f.as_bool())
                 .unwrap_or(false);
-            out.push(ServerEvent::Transcript { role: Role::User, text: t.to_string(), final_ });
+            out.push(ServerEvent::Transcript {
+                role: Role::User,
+                text: t.to_string(),
+                final_,
+            });
         }
-        if sc.get("interrupted").and_then(|i| i.as_bool()).unwrap_or(false) {
+        if sc
+            .get("interrupted")
+            .and_then(|i| i.as_bool())
+            .unwrap_or(false)
+        {
             out.push(ServerEvent::Interrupted);
         }
-        if sc.get("turnComplete").and_then(|t| t.as_bool()).unwrap_or(false) {
+        if sc
+            .get("turnComplete")
+            .and_then(|t| t.as_bool())
+            .unwrap_or(false)
+        {
             out.push(ServerEvent::TurnComplete);
         }
     }
 
-    if let Some(calls) = v.pointer("/toolCall/functionCalls").and_then(|c| c.as_array()) {
+    if let Some(calls) = v
+        .pointer("/toolCall/functionCalls")
+        .and_then(|c| c.as_array())
+    {
         for call in calls {
-            let name = call.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
-            let id = call.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string();
+            let name = call
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let id = call
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or_default()
+                .to_string();
             let args = call.get("args").cloned().unwrap_or(Value::Null);
             out.push(ServerEvent::ToolCall { name, id, args });
         }
     }
 
-    if let Some(h) = v.pointer("/sessionResumptionUpdate/newHandle").and_then(|h| h.as_str()) {
+    if let Some(h) = v
+        .pointer("/sessionResumptionUpdate/newHandle")
+        .and_then(|h| h.as_str())
+    {
         out.push(ServerEvent::ResumptionHandle(h.to_string()));
     }
 
@@ -260,7 +297,11 @@ mod tests {
         SetupConfig {
             model,
             voice: "Autonoe".into(),
-            language: if model.is_native() { None } else { Some("en-US".into()) },
+            language: if model.is_native() {
+                None
+            } else {
+                Some("en-US".into())
+            },
             system_instruction: "Be nice.".into(),
             temperature: TEMPERATURE,
             goal_schema: serde_json::json!({"type":"object","required":["disposition"]}),
@@ -275,9 +316,15 @@ mod tests {
         assert_eq!(setup["model"], "models/gemini-3.1-flash-live-preview");
         assert_eq!(setup["generationConfig"]["responseModalities"][0], "AUDIO");
         assert_eq!(setup["generationConfig"]["temperature"], TEMPERATURE as f64);
-        assert_eq!(setup["generationConfig"]["speechConfig"]["voiceConfig"]
-            ["prebuiltVoiceConfig"]["voiceName"], "Autonoe");
-        assert_eq!(setup["generationConfig"]["speechConfig"]["languageCode"], "en-US");
+        assert_eq!(
+            setup["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]
+                ["voiceName"],
+            "Autonoe"
+        );
+        assert_eq!(
+            setup["generationConfig"]["speechConfig"]["languageCode"],
+            "en-US"
+        );
         // Exactly one tool: end_call, parameters == goal_schema.
         let decl = &setup["tools"][0]["functionDeclarations"][0];
         assert_eq!(decl["name"], "end_call");
@@ -304,7 +351,10 @@ mod tests {
     fn native_audio_setup_shape() {
         let s = build_setup(&cfg(Model::NativeAudio, Some("H1".into())));
         let setup = &s["setup"];
-        assert_eq!(setup["model"], "models/gemini-2.5-flash-native-audio-latest");
+        assert_eq!(
+            setup["model"],
+            "models/gemini-2.5-flash-native-audio-latest"
+        );
         // No languageCode on native.
         assert!(setup["generationConfig"]["speechConfig"]["languageCode"].is_null());
         // proactivity is a top-level setup field (path per the google-genai live
@@ -315,9 +365,15 @@ mod tests {
         assert!(setup["enableAffectiveDialog"].is_null());
         assert_eq!(setup["generationConfig"]["enableAffectiveDialog"], true);
         // Reasoning disabled on native (lower latency).
-        assert_eq!(setup["generationConfig"]["thinkingConfig"]["thinkingBudget"], 0);
+        assert_eq!(
+            setup["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            0
+        );
         // NON_BLOCKING behavior on end_call.
-        assert_eq!(setup["tools"][0]["functionDeclarations"][0]["behavior"], "NON_BLOCKING");
+        assert_eq!(
+            setup["tools"][0]["functionDeclarations"][0]["behavior"],
+            "NON_BLOCKING"
+        );
         // Native VAD.
         let aad = &setup["realtimeInputConfig"]["automaticActivityDetection"];
         assert_eq!(aad["startOfSpeechSensitivity"], "START_SENSITIVITY_HIGH");
@@ -379,8 +435,10 @@ mod parse_tests {
         assert!(from_string
             .iter()
             .any(|e| matches!(e, ServerEvent::OutputAudio(s) if s == &vec![0, 1, 2, 3])));
-        assert!(from_string.iter().any(|e| matches!(e,
-            ServerEvent::Transcript { role: Role::Model, text, final_: false } if text == "Hello")));
+        assert!(
+            from_string.iter().any(|e| matches!(e,
+            ServerEvent::Transcript { role: Role::Model, text, final_: false } if text == "Hello"))
+        );
     }
 
     #[test]
@@ -406,7 +464,11 @@ mod parse_tests {
         let evs = parse_server_message(text.as_bytes()).unwrap();
         assert_eq!(
             evs,
-            vec![ServerEvent::Transcript { role: Role::Model, text: "Bye".into(), final_: true }]
+            vec![ServerEvent::Transcript {
+                role: Role::Model,
+                text: "Bye".into(),
+                final_: true
+            }]
         );
     }
 
@@ -416,7 +478,11 @@ mod parse_tests {
         let evs = parse_server_message(text.as_bytes()).unwrap();
         assert_eq!(
             evs,
-            vec![ServerEvent::Transcript { role: Role::User, text: "Hi".into(), final_: false }]
+            vec![ServerEvent::Transcript {
+                role: Role::User,
+                text: "Hi".into(),
+                final_: false
+            }]
         );
     }
 
@@ -455,7 +521,10 @@ mod parse_tests {
             parse_server_message(br#"{"setupComplete":{}}"#).unwrap(),
             vec![ServerEvent::SetupComplete]
         );
-        assert_eq!(parse_server_message(br#"{"goAway":{}}"#).unwrap(), vec![ServerEvent::GoAway]);
+        assert_eq!(
+            parse_server_message(br#"{"goAway":{}}"#).unwrap(),
+            vec![ServerEvent::GoAway]
+        );
     }
 
     #[test]
@@ -465,6 +534,9 @@ mod parse_tests {
 
     #[test]
     fn empty_object_yields_no_events() {
-        assert_eq!(parse_server_message(b"{}").unwrap(), Vec::<ServerEvent>::new());
+        assert_eq!(
+            parse_server_message(b"{}").unwrap(),
+            Vec::<ServerEvent>::new()
+        );
     }
 }
