@@ -17,4 +17,4 @@ Early. Built layer-by-layer: `types` → `wire` → `transport` → `session`.
 
 ## License
 
-MIT OR Apache-2.0
+MIT — see [LICENSE](LICENSE).
