@@ -197,11 +197,14 @@ pub fn build_setup(cfg: &SetupConfig) -> Value {
     }
 
     let aad = if native {
-        // LOW start-sensitivity so background noise on the callee's side (a real
-        // trunk / a caller in a car, unlike the clean LAN this was first tuned
-        // on) is not mistaken for speech onset — which kept Gemini "hearing" the
-        // caller talk forever, so it never committed the turn and never replied.
-        // HIGH end-sensitivity commits the turn readily once real speech stops.
+        // LOW start-sensitivity: don't let caller-side background noise (a real
+        // trunk / a caller in a car) be mistaken for speech onset. LOW alone
+        // under-triggered on the quiet real-line audio (~-32 dBFS), stalling
+        // Gemini for 15-19 s before it committed the caller's turn — so the
+        // uplink is level-normalised (AGC) BEFORE Gemini sees it (see the bridge
+        // uplink task), lifting soft real speech above LOW's threshold without
+        // reintroducing noise-triggering. END_SENSITIVITY_HIGH commits the turn
+        // readily once real speech stops.
         json!({
             "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
             "endOfSpeechSensitivity": "END_SENSITIVITY_HIGH",
@@ -230,18 +233,20 @@ pub fn build_setup(cfg: &SetupConfig) -> Value {
         "outputAudioTranscription": {}
     });
 
+    // Disable model "thinking" in BOTH modes for lowest latency. Per the SDK
+    // (ThinkingConfig.thinkingBudget) 0 = DISABLED; it nests under
+    // generationConfig in LiveClientSetup. Valid for both live models
+    // (native = 2.5-flash-native-audio, half-cascade = 3.1-flash-live, both
+    // thinking-capable — the API errors only when set on a non-thinking model).
+    setup["generationConfig"]["thinkingConfig"] = json!({ "thinkingBudget": 0 });
+
     if native {
         // native-audio v1alpha extras — wire placement per the google-genai
-        // live converter (`_live_converters.py`): `thinkingConfig` and
-        // `enableAffectiveDialog` nest under `generationConfig`; `proactivity`
-        // is a top-level `setup` field.
-        setup["generationConfig"]["thinkingConfig"] = json!({ "thinkingBudget": 0 });
-        // Unlike kutsu's `proto.rs` (which keeps this OFF as a workaround —
-        // its hand-rolled parser doesn't strip the `<ctrl95>`/`emotion_*`
-        // affective control tokens, so they leaked into transcript/audio),
-        // this crate re-enables it: `parse_server_message` below mirrors the
-        // SDK's `thought`-part filtering, so those annotation parts never
-        // reach content in the first place.
+        // live converter (`_live_converters.py`): `enableAffectiveDialog` nests
+        // under `generationConfig`; `proactivity` is a top-level `setup` field.
+        // Affective dialog is re-enabled (unlike kutsu's old proto.rs): the
+        // crate's `parse_server_message` strips the `<ctrl95>`/`emotion_*`
+        // thought parts, so they never reach transcript/audio.
         setup["generationConfig"]["enableAffectiveDialog"] = json!(true);
         setup["proactivity"] = json!({ "proactiveAudio": true });
     }
@@ -347,7 +352,8 @@ mod tests {
         // No native-only fields.
         assert!(setup["enableAffectiveDialog"].is_null());
         assert!(setup["generationConfig"]["enableAffectiveDialog"].is_null());
-        assert!(setup["generationConfig"]["thinkingConfig"].is_null());
+        // Thinking is disabled in BOTH modes (native + half-cascade).
+        assert_eq!(setup["generationConfig"]["thinkingConfig"]["thinkingBudget"], 0);
         assert!(setup["proactivity"].is_null());
         // Top-level wrapper key is snake_case `setup`.
         assert!(s.get("setup").is_some());

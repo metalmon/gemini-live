@@ -375,6 +375,28 @@ async fn driver_task<T: Transport>(
                 },
                 msg = transport.recv() => match msg {
                     Some(Ok(bytes)) => {
+                        // DIAG (gated on KUTSU_GEMINI_DIAG=1): compact summary of
+                        // every inbound server message, to see what Gemini does
+                        // during the silence windows where it stops replying.
+                        if std::env::var("KUTSU_GEMINI_DIAG").as_deref() == Ok("1") {
+                            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                let keys: Vec<String> = v.as_object()
+                                    .map(|o| o.keys().cloned().collect())
+                                    .unwrap_or_default();
+                                let sc = &v["serverContent"];
+                                tracing::info!(
+                                    target: "gemini_diag",
+                                    ?keys,
+                                    model_turn = !sc["modelTurn"].is_null(),
+                                    turn_complete = !sc["turnComplete"].is_null(),
+                                    generation_complete = !sc["generationComplete"].is_null(),
+                                    interrupted = !sc["interrupted"].is_null(),
+                                    input_tx = !sc["inputTranscription"].is_null(),
+                                    output_tx = !sc["outputTranscription"].is_null(),
+                                    "server msg"
+                                );
+                            }
+                        }
                         // Malformed frames are skipped (never fatal).
                         if let Ok(evs) = wire::parse_server_message(&bytes) {
                             let mut goaway = false;
