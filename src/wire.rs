@@ -197,8 +197,14 @@ pub fn build_setup(cfg: &SetupConfig) -> Value {
     }
 
     let aad = if native {
+        // LOW start-sensitivity so background noise on the callee's side (a real
+        // trunk / a caller in a car, unlike the clean LAN this was first tuned
+        // on) is not mistaken for speech onset — which kept Gemini "hearing" the
+        // caller talk forever, so it never committed the turn and never replied.
+        // HIGH end-sensitivity commits the turn readily once real speech stops.
         json!({
-            "startOfSpeechSensitivity": "START_SENSITIVITY_HIGH",
+            "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
+            "endOfSpeechSensitivity": "END_SENSITIVITY_HIGH",
             "prefixPaddingMs": 300,
             "silenceDurationMs": 100
         })
@@ -374,9 +380,11 @@ mod tests {
             setup["tools"][0]["functionDeclarations"][0]["behavior"],
             "NON_BLOCKING"
         );
-        // Native VAD.
+        // Native VAD: LOW start-sensitivity (ignore caller-side background
+        // noise), HIGH end-sensitivity (commit the turn once speech stops).
         let aad = &setup["realtimeInputConfig"]["automaticActivityDetection"];
-        assert_eq!(aad["startOfSpeechSensitivity"], "START_SENSITIVITY_HIGH");
+        assert_eq!(aad["startOfSpeechSensitivity"], "START_SENSITIVITY_LOW");
+        assert_eq!(aad["endOfSpeechSensitivity"], "END_SENSITIVITY_HIGH");
         assert_eq!(aad["prefixPaddingMs"], 300);
         assert_eq!(aad["silenceDurationMs"], 100);
         // Resumption handle carried.
