@@ -501,7 +501,20 @@ async fn send_setup<T: Transport>(
 /// Perform the byte-identical transport write for one outbound command.
 async fn write_cmd<T: Transport>(transport: &mut T, cmd: Command) -> Result<(), TransportError> {
     match cmd {
-        Command::Audio(pcm) => transport.send_text(wire::build_realtime_input(&pcm)).await,
+        Command::Audio(pcm) => {
+            // DIAG (KUTSU_GEMINI_DIAG=1): a per-frame WS write should be near-
+            // instant (~50 frames/s). If it takes long the socket is
+            // backpressuring — uplink audio isn't leaving fast enough, pointing
+            // at a throttled/DPI'd network path rather than Gemini's own VAD.
+            let msg = wire::build_realtime_input(&pcm);
+            let t0 = std::time::Instant::now();
+            let r = transport.send_text(msg).await;
+            let ms = t0.elapsed().as_millis();
+            if ms > 40 && std::env::var("KUTSU_GEMINI_DIAG").as_deref() == Ok("1") {
+                tracing::warn!(target: "gemini_diag", send_ms = ms as u64, "uplink WS send backpressure (network/DPI?)");
+            }
+            r
+        }
         Command::ClientText(t) => transport.send_text(wire::build_client_content(&t)).await,
         Command::ToolResponse(id) => transport.send_text(wire::build_tool_response(&id)).await,
     }
