@@ -38,8 +38,10 @@ fn decode_pcm16(b64: &str) -> Result<Vec<i16>, WireError> {
         .or_else(|_| URL_SAFE_NO_PAD.decode(b64))
         .map_err(|e| WireError(format!("bad base64 audio: {e}")))?;
     Ok(bytes
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes(*b))
         .collect())
 }
 
