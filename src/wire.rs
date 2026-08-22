@@ -353,7 +353,10 @@ mod tests {
         assert!(setup["enableAffectiveDialog"].is_null());
         assert!(setup["generationConfig"]["enableAffectiveDialog"].is_null());
         // Thinking is disabled in BOTH modes (native + half-cascade).
-        assert_eq!(setup["generationConfig"]["thinkingConfig"]["thinkingBudget"], 0);
+        assert_eq!(
+            setup["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            0
+        );
         assert!(setup["proactivity"].is_null());
         // Top-level wrapper key is snake_case `setup`.
         assert!(s.get("setup").is_some());
